@@ -381,26 +381,16 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
         if (max_inserts > 0) {
             mc->max_inserts = max_inserts;
         }
+        const char * mode = std::getenv("LLAMA_MOE_CACHE_MODE");
+        // Rejected split/import paths remain archived, not runtime-selectable.
+        if (!mode || std::strcmp(mode, "vulkan_host") != 0) {
+            fail_init("only_vulkan_host_mode_supported");
+            return;
+        }
+        mc->vulkan_host_mode = true;
         const char * hotset_path = std::getenv("LLAMA_MOE_CACHE_HOTSET");
         const auto hotset = load_hotset(hotset_path);
         const bool static_requested = !hotset.empty();
-        if (const char * mode = std::getenv("LLAMA_MOE_CACHE_MODE")) {
-            if (mode[0] && std::strcmp(mode, "full") != 0 && std::strcmp(mode, "down") != 0 &&
-                    std::strcmp(mode, "vulkan_host") != 0 && std::strcmp(mode, "vulkan_import") != 0 &&
-                    std::strcmp(mode, "vulkan_exact") != 0) {
-                fail_init("unknown_cache_mode");
-                return;
-            }
-            mc->down_only = std::strcmp(mode, "down") == 0;
-            mc->vulkan_import_mode = std::strcmp(mode, "vulkan_import") == 0;
-            mc->vulkan_exact_mode = std::strcmp(mode, "vulkan_exact") == 0;
-            mc->vulkan_host_mode = std::strcmp(mode, "vulkan_host") == 0 || mc->vulkan_import_mode || mc->vulkan_exact_mode;
-        }
-        if ((mc->down_only || mc->vulkan_import_mode || mc->vulkan_exact_mode) &&
-                !cache_env_enabled("LLAMA_MOE_CACHE_ALLOW_EXPERIMENTAL")) {
-            fail_init("cache_mode_requires_ALLOW_EXPERIMENTAL_1");
-            return;
-        }
         mc->adaptive = mc->vulkan_host_mode && !mc->vulkan_import_mode && !mc->vulkan_exact_mode &&
             cache_env_enabled("LLAMA_MOE_CACHE_ADAPTIVE");
         const char * admission = std::getenv("LLAMA_MOE_CACHE_ADMISSION");
