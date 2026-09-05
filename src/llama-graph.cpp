@@ -2376,7 +2376,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 ggml_tensor * ids_t = ggml_view_2d(ctx0, mc_slot_ids,
                         mc_slot_ids->ne[0], 1, mc_slot_ids->nb[1], it*mc_slot_ids->nb[1]);
                 ggml_tensor * part = ggml_mul_mat_id(ctx0, mcache->down_c, cur_t, ids_t);
-                memcpy(part->op_params + 4*sizeof(int32_t), &moe_skip_raw, sizeof(moe_skip_raw));
+                part->op_params[4] = moe_skip_raw;
                 cb(part, "ffn_moe_cache_down_token", il);
                 down_g = down_g ? ggml_concat(ctx0, down_g, part, 2) : part;
             }
@@ -2397,8 +2397,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
                 ggml_tensor * up_g   = ggml_mul_mat_id(ctx0, mcache->up_c,   inp_t, ids_t);
                 ggml_tensor * gate_g = ggml_mul_mat_id(ctx0, mcache->gate_c, inp_t, ids_t);
-                memcpy(up_g->op_params   + 4*sizeof(int32_t), &moe_skip_raw, sizeof(moe_skip_raw));
-                memcpy(gate_g->op_params + 4*sizeof(int32_t), &moe_skip_raw, sizeof(moe_skip_raw));
+                up_g->op_params[4] = moe_skip_raw;
+                gate_g->op_params[4] = moe_skip_raw;
 
                 ggml_tensor * act_g = nullptr;
                 const float limit = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
@@ -2418,7 +2418,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 }
 
                 ggml_tensor * part = ggml_mul_mat_id(ctx0, mcache->down_c, act_g, ids_t);
-                memcpy(part->op_params + 4*sizeof(int32_t), &moe_skip_raw, sizeof(moe_skip_raw));
+                part->op_params[4] = moe_skip_raw;
                 cb(part, "ffn_moe_cache_full_token", il);
                 down_g = down_g ? ggml_concat(ctx0, down_g, part, 2) : part;
             }

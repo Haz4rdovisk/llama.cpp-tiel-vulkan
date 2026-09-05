@@ -2,7 +2,7 @@
 
 This private development snapshot preserves the RX590 work before further cleanup. It is not a production release or an upstream submission. Code was developed with AI assistance under user direction. Original authorship, history and licenses remain intact.
 
-Base commit: `bccbacdb8945680f1cfc7e6bffd1e59014705750`, the expert-cache branch by csantiago78, on top of llama.cpp. The 31 implementation files in this snapshot match the active DEV source byte-for-byte. The original DEV and production trees were not changed during publication.
+Base commit: `bccbacdb8945680f1cfc7e6bffd1e59014705750`, the expert-cache branch by csantiago78, on top of llama.cpp. The initial snapshot preserved 31 DEV implementation files byte-for-byte. The legacy-marker follow-up was also applied to DEV. Production was not changed.
 
 ## Candidate architecture
 
@@ -73,7 +73,7 @@ Weight caching does not train or improve model precision. Historical output hash
 
 ## Known defects / excluded paths
 
-**Do not use legacy full/down split modes as a supported release.** Four writes in llama-graph.cpp use `op_params + 4*sizeof(int32_t)` although op_params is int32_t[16]. They address index 16 rather than index 4, outside the array. Candidate vulkan_host uses op_params[4] and avoids these split branches. The defect is preserved and disclosed in this exact development snapshot, not silently fixed without testing.
+**Do not use legacy full/down split modes as a supported release.** The initial snapshot retained four writes at `op_params + 4*sizeof(int32_t)` although op_params is int32_t[16]. A follow-up changes them to op_params[4]; the old offset overwrote tensor flags. The changed graph translation unit compiled, and a standalone test with the real ggml_tensor header plus ASan/UBSan checked marker/flags behavior at four capacities. This is not full legacy-mode inference validation. Candidate vulkan_host already used op_params[4] and its branch is unchanged. The full DEV server build was subsequently relinked successfully; corrected libllama SHA256 is `602639b82e4935baf48ac19a66776311f8927105f0cbfcefecdc97a87efdf4a7`.
 
 Down/import/exact require LLAMA_MOE_CACHE_ALLOW_EXPERIMENTAL=1; do not enable it for the candidate. Full remains accessible and is not guarded like those modes. The external-host-import experiment failed on this hardware. Exact mode retains a single-GPU/backend-0 assumption. Legacy custom backend tests need consolidation. These are release blockers, not evidence that all paths are correct.
 
