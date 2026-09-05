@@ -2035,6 +2035,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     //synchronize();
 
     // apply throttled MoE expert-cache updates between graph executions
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
+        llama_moe_cache_update_vulkan(sched.get(), n_tokens_all);
+    }
     llama_moe_cache_step();
 
     return 0;

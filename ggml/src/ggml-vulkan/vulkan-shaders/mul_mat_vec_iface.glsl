@@ -33,3 +33,10 @@ layout (binding = 4) readonly buffer Fuse1 {D_TYPE data_fuse1[];};
 layout (binding = 5) readonly buffer IDS {int data_ids[];};
 #endif
 
+#ifdef MUL_MAT_ID_HYBRID
+layout (binding = 6) readonly buffer HOT_A {A_TYPE hot_data_a[];};
+#if defined(A_TYPE_PACKED16)
+layout (binding = 6) readonly buffer HOT_A_PACKED16 {A_TYPE_PACKED16 hot_data_a_packed16[];};
+#endif
+#endif
+

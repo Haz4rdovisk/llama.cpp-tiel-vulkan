@@ -1641,6 +1641,26 @@ static void test_msgs_oaicompat_json_conversion() {
 static void test_msg_token_delimiters_split() {
     LOG_DBG("%s\n", __func__);
 
+    {
+        common_chat_msg_spans spans;
+        assert_equals<int32_t>(-1, spans.last_checkpoint_pos(true));
+        assert_equals(false, spans.is_checkpoint_start(0, true));
+        spans.add(COMMON_CHAT_ROLE_SYSTEM, 0, 100);
+        spans.add(COMMON_CHAT_ROLE_USER, 100, 50);
+        spans.add(COMMON_CHAT_ROLE_ASSISTANT, 150, 200);
+        spans.add(COMMON_CHAT_ROLE_TOOL, 350, 12000);
+        spans.add(COMMON_CHAT_ROLE_ASSISTANT, 12350, 50);
+        spans.add(COMMON_CHAT_ROLE_TOOL, 12400, 1000);
+        assert_equals<int32_t>(100, spans.last_user_message_pos());
+        assert_equals<int32_t>(100, spans.last_checkpoint_pos(false));
+        assert_equals<int32_t>(12400, spans.last_checkpoint_pos(true));
+        for (int32_t pos : {0, 100, 150, 350, 351, 12350, 12400, 13400}) {
+            assert_equals(pos == 100, spans.is_user_start(pos));
+            assert_equals(pos == 100, spans.is_checkpoint_start(pos, false));
+            assert_equals(pos == 100 || pos == 350 || pos == 12400, spans.is_checkpoint_start(pos, true));
+        }
+    }
+
     // Delimiters that share a leading token, distinguished by the second token,
     // to exercise the per-position token matching.
     const common_chat_msg_delimiters delims = {

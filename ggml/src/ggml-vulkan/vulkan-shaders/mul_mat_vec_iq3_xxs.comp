@@ -7,20 +7,51 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
 
+float load_iq3xxs_d(const uint idx) {
+#ifdef MUL_MAT_ID_HYBRID
+    if (use_hot_expert) {
+        return float(hot_data_a[idx].d);
+    }
+    return float(data_a[idx].d);
+#else
+    return float(data_a[idx].d);
+#endif
+}
+uint load_iq3xxs_qs(const uint idx, const uint q) {
+#ifdef MUL_MAT_ID_HYBRID
+    if (use_hot_expert) {
+        return hot_data_a[idx].qs[q];
+    }
+    return data_a[idx].qs[q];
+#else
+    return data_a[idx].qs[q];
+#endif
+}
+uint load_iq3xxs_qs16(const uint idx, const uint q) {
+#ifdef MUL_MAT_ID_HYBRID
+    if (use_hot_expert) {
+        return hot_data_a_packed16[idx].qs[q];
+    }
+    return data_a_packed16[idx].qs[q];
+#else
+    return data_a_packed16[idx].qs[q];
+#endif
+}
+
 void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
     const uint y_idx = i * QUANT_K + 16 * itid;
     const uint ib32 = itid / 2; // 0..7
 
     uint ibi = a_offset + first_row * num_blocks_per_row + i;
     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-        const float d = float(data_a[ibi].d);
+        const float d = load_iq3xxs_d(ibi);
         const uint signscale = pack32(u16vec2(
-            data_a_packed16[ibi].qs[QUANT_K / 8 + 2 * ib32],
-            data_a_packed16[ibi].qs[QUANT_K / 8 + 2 * ib32 + 1]));
+            load_iq3xxs_qs16(ibi, QUANT_K / 8 + 2 * ib32),
+            load_iq3xxs_qs16(ibi, QUANT_K / 8 + 2 * ib32 + 1)));
         const float db = d * 0.5 * (0.5 + (signscale >> 28));
         [[unroll]] for (uint l = 0; l < 2; ++l) {
-            const uint qs0 = data_a[ibi].qs[8 * ib32 + 4 * (itid & 1) + 2 * l];
-            const uint qs1 = data_a[ibi].qs[8 * ib32 + 4 * (itid & 1) + 2 * l + 1];
+            const uint qs0 = load_iq3xxs_qs(ibi, 8 * ib32 + 4 * (itid & 1) + 2 * l);
+            const uint qs1 = load_iq3xxs_qs(ibi, 8 * ib32 + 4 * (itid & 1) + 2 * l + 1);
             const uint sign = bitfieldExtract(signscale, 7 * int(2 * (itid & 1) + l), 7);
             const uint sign7 = bitCount(sign);
             const vec4 grid0 = vec4(unpack8(iq3xxs_grid[qs0]));
@@ -50,6 +81,7 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, 
 void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     uint a_offset, b_offset, d_offset;
     get_offsets(a_offset, b_offset, d_offset);
+    if (should_skip_expert()) { return; }
 
     const uint num_blocks_per_row = p.ncols / QUANT_K;
 

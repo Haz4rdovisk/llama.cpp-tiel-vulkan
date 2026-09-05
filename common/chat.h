@@ -170,23 +170,26 @@ struct common_chat_msg_spans {
         spans.push_back({ role, pos, len });
     }
 
-    bool is_user_start(int32_t pos) const {
+    bool is_checkpoint_start(int32_t pos, bool include_tools = false) const {
         for (auto it = spans.begin(); it != spans.end(); ++it) {
-            if (it->role == COMMON_CHAT_ROLE_USER && pos == (int32_t) it->pos) {
+            if ((it->role == COMMON_CHAT_ROLE_USER || (include_tools && it->role == COMMON_CHAT_ROLE_TOOL)) && pos == (int32_t) it->pos) {
                 return true;
             }
         }
         return false;
     }
 
-    int32_t last_user_message_pos() const {
+    int32_t last_checkpoint_pos(bool include_tools = false) const {
         for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
-            if (it->role == COMMON_CHAT_ROLE_USER) {
+            if (it->role == COMMON_CHAT_ROLE_USER || (include_tools && it->role == COMMON_CHAT_ROLE_TOOL)) {
                 return (int32_t) it->pos;
             }
         }
         return -1;
     }
+
+    bool is_user_start(int32_t pos) const { return is_checkpoint_start(pos); }
+    int32_t last_user_message_pos() const { return last_checkpoint_pos(); }
 };
 
 struct common_chat_msg_delimiter {

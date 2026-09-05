@@ -1629,7 +1629,7 @@ static void ggml_compute_forward_mul_mat_id(
         // chain, so this op skips them and zeroes their dst rows instead.
         const int32_t * moe_tbl   = NULL;
         int32_t         moe_dummy = 0;
-        if (dst->src[3]) {
+        if (dst->src[3] && dst->src[3]->type == GGML_TYPE_I32) {
             moe_tbl   = (const int32_t *) dst->src[3]->data;
             moe_dummy = ggml_get_op_params_i32(dst, 0);
         }
@@ -1637,7 +1637,17 @@ static void ggml_compute_forward_mul_mat_id(
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < n_ids; ++id) {
-                const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                const int32_t routed_i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                const bool hybrid_ids = dst->src[3] && dst->src[3]->type == src0->type &&
+                    ggml_get_op_params_i32(dst, 4) > 0;
+                const int32_t i02 = hybrid_ids ? (int32_t) (((uint32_t) routed_i02) >> 16) : routed_i02;
+                const int32_t skip_raw = ggml_get_op_params_i32(dst, 4);
+                const int32_t skip_id = (!hybrid_ids && skip_raw > 0) ? skip_raw - 1 : -1;
+
+                if (i02 == skip_id) {
+                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                    continue;
+                }
 
                 assert(i02 >= 0 && i02 < n_as);
 

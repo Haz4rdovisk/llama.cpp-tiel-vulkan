@@ -910,6 +910,40 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 
 // returns the backend that should be used for the node based on the current locations
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
+    // Anchor hybrid decode to its hot cache. Other nodes use normal scheduling.
+    const bool ft_vkhost_src0 =
+        tensor->op == GGML_OP_MUL_MAT_ID &&
+        tensor->src[0] != NULL && tensor->src[0]->buffer != NULL &&
+        strcmp(ggml_backend_buft_name(tensor->src[0]->buffer->buft), "Vulkan_Host") == 0;
+    const bool ft_hybrid =
+        ft_vkhost_src0 &&
+        tensor->src[3] != NULL &&
+        tensor->src[3]->type == tensor->src[0]->type &&
+        ggml_get_op_params_i32(tensor, 4) > 0;
+    const bool ft_exact =
+        ft_vkhost_src0 &&
+        tensor->src[4] != NULL &&
+        tensor->src[4]->type == tensor->src[0]->type;
+
+    if (ft_exact) {
+        // DEV FreeToken target: Vulkan0 is backend 0 on this single-GPU host.
+        // The hot-cache tensor is allocated from Vulkan0 and Vulkan_Host is
+        // explicitly supported by the same backend, so bypass scheduler
+        // heuristics that otherwise keep tiny MoE nodes on CPU.
+        GGML_ASSERT(sched->n_backends > 1);
+        GGML_ASSERT(ggml_backend_supports_buft(sched->backends[0], tensor->src[4]->buffer->buft));
+        SET_CAUSE(tensor, "1.ftex");
+        return 0;
+    }
+
+    if (ft_hybrid) {
+        const int hybrid_backend_id = ggml_backend_sched_backend_from_buffer(sched, tensor->src[3], tensor);
+        if (hybrid_backend_id != -1) {
+            SET_CAUSE(tensor, "1.ftk");
+            return hybrid_backend_id;
+        }
+    }
+
     // assign pre-allocated nodes to their backend
     int cur_backend_id = ggml_backend_sched_backend_from_buffer(sched, tensor, tensor);
     if (cur_backend_id != -1) {
@@ -1025,9 +1059,21 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
     }
 }
 
-static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, struct ggml_tensor * t, int backend_id) {
+static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, struct ggml_tensor * t, int backend_id,
+        const struct ggml_tensor * op) {
     ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
     ggml_backend_buffer_type_t buft = NULL;
+
+    // Only the hybrid kernel reads pinned cold weights without a staging copy.
+    if (buf && op->op == GGML_OP_MUL_MAT_ID && t == op->src[0] &&
+        op->src[3] && op->src[3]->buffer && op->src[3]->type == t->type &&
+        ggml_get_op_params_i32(op, 4) > 0 &&
+        strcmp(ggml_backend_buft_name(buf->buft), "Vulkan_Host") == 0 &&
+        ggml_backend_buft_get_device(buf->buft) == ggml_backend_get_device(sched->backends[backend_id]) &&
+        ggml_backend_supports_buft(sched->backends[backend_id], op->src[3]->buffer->buft) &&
+        ggml_backend_supports_op(sched->backends[backend_id], op)) {
+        return true;
+    }
 
     if (buf) {
         // the tensor is already allocated
@@ -1217,7 +1263,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         if (src == NULL) {
                             continue;
                         }
-                        if ((tensor_backend_id(src) != -1 || tensor_backend_id(src->view_src) != -1) && ggml_backend_sched_buffer_supported(sched, src, b)) {
+                        if ((tensor_backend_id(src) != -1 || tensor_backend_id(src->view_src) != -1) && ggml_backend_sched_buffer_supported(sched, src, b, node)) {
                             n_supported++;
                         }
                     }
@@ -1238,7 +1284,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         if (src == NULL) {
                             continue;
                         }
-                        if (!ggml_backend_sched_buffer_supported(sched, src, b)) {
+                        if (!ggml_backend_sched_buffer_supported(sched, src, b, node)) {
                             supported = false;
                             break;
                         }
@@ -1324,7 +1370,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     // by starting a new split, the memory of the previously offloaded weights can be reused
                     if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                         int src_backend_id = tensor_backend_id(src);
-                        if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                        if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id, node)) {
                             need_new_split = true;
                             break;
                         }
@@ -1334,7 +1380,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     if (split->n_inputs >= split->inputs_capacity) {
                         const size_t id = hash_id(src);
                         int src_backend_id = sched->hv_tensor_backend_ids[id];
-                        bool supported = ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
+                        bool supported = ggml_backend_sched_buffer_supported(sched, src, cur_backend_id, node);
                         if (src_backend_id != cur_backend_id && tensor_id_copy(id, cur_backend_id, 0) == NULL && !supported) {
                             need_new_split = true;
                             break;
@@ -1398,7 +1444,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                 }
 
-                if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id, node)) {
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
@@ -1601,6 +1647,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
+    static const int64_t vk_moe_full_copy_min = []() -> int64_t {
+        const char * value = getenv("GGML_VK_MOE_PREFILL_FULL_COPY_MIN");
+        return value ? std::max<int64_t>(0, atoll(value)) : 0;
+    }();
+
     int prev_backend_id = -1;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
@@ -1651,6 +1702,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
+
+                    // Dense prefill routing can use one copy without a route readback.
+                    if (vk_moe_full_copy_min > 0 && node->src[2]->ne[1] >= vk_moe_full_copy_min &&
+                        strcmp(ggml_backend_buft_name(input->buffer->buft), "Vulkan_Host") == 0 &&
+                        ggml_backend_buft_get_device(input->buffer->buft) == ggml_backend_get_device(split_backend)) {
+                        ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                        continue;
+                    }
 
                     ggml_backend_synchronize(input_backend);
 

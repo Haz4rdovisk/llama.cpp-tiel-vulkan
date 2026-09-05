@@ -31,6 +31,7 @@ layout (push_constant) uniform parameter
     uint ne11;
     uint expert_i1;
     uint nbi1;
+    uint skip_expert_id;
 #else
     uint base_work_group_y;
     uint ne02;
@@ -42,11 +43,31 @@ layout (push_constant) uniform parameter
 
 #ifdef MUL_MAT_ID
 uint expert_id;
+#ifdef MUL_MAT_ID_HYBRID
+bool use_hot_expert;
+uint weight_expert_id;
 #endif
+#endif
+
+bool should_skip_expert() {
+#ifdef MUL_MAT_ID_HYBRID
+    return false;
+#elif defined(MUL_MAT_ID)
+    return expert_id == p.skip_expert_id;
+#else
+    return false;
+#endif
+}
 
 void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 #ifdef MUL_MAT_ID
+#ifdef MUL_MAT_ID_HYBRID
+    const uint expert_i0 = gl_WorkGroupID.y % p.nei0;
+    const uint expert_i1 = p.expert_i1 == 0xffffffffu ? gl_WorkGroupID.y / p.nei0 : p.expert_i1;
+#else
     const uint expert_i0 = gl_WorkGroupID.y;
+    const uint expert_i1 = p.expert_i1;
+#endif
 #else
     const uint batch_idx = gl_WorkGroupID.y + p.base_work_group_y;
 #endif
@@ -63,24 +84,36 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
         batch_idx_a = i03 * p.ne02 + i02;
     }
 #else
-    expert_id = data_ids[expert_i0 + p.expert_i1 * p.nbi1];
+    const uint routed_id = uint(data_ids[expert_i0 + expert_i1 * p.nbi1]);
+#ifdef MUL_MAT_ID_HYBRID
+    expert_id = routed_id >> 16;
+    const uint mapped_slot = routed_id & 0xffffu;
+    use_hot_expert = mapped_slot < p.skip_expert_id;
+    weight_expert_id = use_hot_expert ? mapped_slot : expert_id;
+#else
+    expert_id = routed_id;
+#endif
 #endif
 
     a_offset =
 #ifdef MUL_MAT_ID
+#ifdef MUL_MAT_ID_HYBRID
+            weight_expert_id * (p.batch_stride_a / QUANT_K);
+#else
             expert_id * (p.batch_stride_a / QUANT_K);
+#endif
 #else
             batch_idx_a * (p.batch_stride_a / QUANT_K);
 #endif
     b_offset =
 #ifdef MUL_MAT_ID
-            (expert_i0 % p.ne11) * p.stride_b + p.expert_i1 * p.batch_stride_b;
+            (expert_i0 % p.ne11) * p.stride_b + expert_i1 * p.batch_stride_b;
 #else
             batch_idx * p.batch_stride_b;
 #endif
     d_offset =
 #ifdef MUL_MAT_ID
-            expert_i0 * p.stride_d + p.expert_i1 * p.batch_stride_d;
+            expert_i0 * p.stride_d + expert_i1 * p.batch_stride_d;
 #else
             batch_idx * p.batch_stride_d;
 #endif

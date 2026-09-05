@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "llama-moecache.h"
 
 #include "llama-arch.h"
 #include "llama-ext.h"
@@ -1183,6 +1184,7 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 }
 
 llama_model::~llama_model() {
+    llama_moe_cache_free(*this);
     for (auto * lora : loras) {
         delete lora;
     }

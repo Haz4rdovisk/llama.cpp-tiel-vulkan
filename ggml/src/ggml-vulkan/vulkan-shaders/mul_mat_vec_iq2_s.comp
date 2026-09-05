@@ -7,6 +7,35 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
 
+float load_iq2s_d(const uint idx) {
+#ifdef MUL_MAT_ID_HYBRID
+    return use_hot_expert ? float(hot_data_a[idx].d) : float(data_a[idx].d);
+#else
+    return float(data_a[idx].d);
+#endif
+}
+uint load_iq2s_scales(const uint idx, const uint q) {
+#ifdef MUL_MAT_ID_HYBRID
+    return use_hot_expert ? hot_data_a[idx].scales[q] : data_a[idx].scales[q];
+#else
+    return data_a[idx].scales[q];
+#endif
+}
+uint load_iq2s_qh(const uint idx, const uint q) {
+#ifdef MUL_MAT_ID_HYBRID
+    return use_hot_expert ? hot_data_a[idx].qh[q] : data_a[idx].qh[q];
+#else
+    return data_a[idx].qh[q];
+#endif
+}
+uint load_iq2s_qs16(const uint idx, const uint q) {
+#ifdef MUL_MAT_ID_HYBRID
+    return use_hot_expert ? hot_data_a_packed16[idx].qs[q] : data_a_packed16[idx].qs[q];
+#else
+    return data_a_packed16[idx].qs[q];
+#endif
+}
+
 void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
     const uint y_idx = i * QUANT_K + 16 * itid;
     const uint nibble_shift = 4 * (itid & 1);
@@ -14,13 +43,13 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, 
 
     uint ibi = a_offset + first_row * num_blocks_per_row + i;
     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-        const float d = float(data_a[ibi].d);
-        const uint scale = (data_a[ibi].scales[ib32] >> nibble_shift) & 0xF;
+        const float d = load_iq2s_d(ibi);
+        const uint scale = (load_iq2s_scales(ibi, ib32) >> nibble_shift) & 0xF;
         const float db = d * (0.5 + scale) * 0.25;
 
-        const uint qh = data_a[ibi].qh[ib32];
-        const u8vec2 qs16 = unpack8(uint32_t(data_a_packed16[ibi].qs[itid])).xy; // vec4 used due to #12147
-        const u8vec2 sign16 = unpack8(uint32_t(data_a_packed16[ibi].qs[QUANT_K / 16 + itid])).xy;
+        const uint qh = load_iq2s_qh(ibi, ib32);
+        const u8vec2 qs16 = unpack8(uint32_t(load_iq2s_qs16(ibi, itid))).xy; // vec4 used due to #12147
+        const u8vec2 sign16 = unpack8(uint32_t(load_iq2s_qs16(ibi, QUANT_K / 16 + itid))).xy;
         [[unroll]] for (uint l = 0; l < 2; ++l) {
             const uint8_t sign = sign16[l];
             const uint qs = qs16[l] | ((qh << (8 - nibble_shift - 2 * l)) & 0x300);
@@ -52,6 +81,7 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, 
 void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     uint a_offset, b_offset, d_offset;
     get_offsets(a_offset, b_offset, d_offset);
+    if (should_skip_expert()) { return; }
 
     const uint num_blocks_per_row = p.ncols / QUANT_K;
 

@@ -4657,6 +4657,7 @@ struct test_mul_mat_hadamard : public test_mul_mat {
 };
 
 static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
+    const bool dup_ids = std::getenv("GGML_TEST_DUP_IDS") != nullptr;
     std::random_device rd;
     std::default_random_engine rng(rd());
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
@@ -4666,7 +4667,7 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
             for (int64_t r = 0; r < ggml_nrows(t); r++) {
                 std::vector<int32_t> data(t->ne[0]);
                 for (int i = 0; i < t->ne[0]; i++) {
-                    data[i] = i % n_mats;
+                    data[i] = dup_ids ? (n_mats - 1) : (i % n_mats);
                 }
                 std::shuffle(data.begin(), data.end(), rng);
                 ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
@@ -4740,6 +4741,103 @@ struct test_mul_mat_id : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
+// Focused FreeToken-lite correctness test: mixed cached ids + one zero dummy slot,
+// 2-token MTP-shaped batch. Vulkan skip-id must match the CPU reference where
+// the same dummy matrix is explicitly zero.
+struct test_mul_mat_id_moe_skip : public test_case {
+    std::string vars() override { return "iq3_xxs,top8,n2,dummy12"; }
+    double max_nmse_err() override { return 5e-4; }
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_MOE_SKIP"; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        constexpr int n_mats = 13, n_used = 8;
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, GGML_TYPE_IQ3_XXS, 256, 512, n_mats);
+        ggml_set_name(as, "as");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, 2);
+        ggml_set_name(ids, "ids");
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, n_used, 2);
+        ggml_set_name(b, "b");
+        ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
+        const int32_t raw = 13;
+        out->op_params[4] = raw;
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "ids") == 0) {
+                const int32_t rows[2][8] = {{0,12,1,12,2,3,12,4},{12,5,6,12,7,8,9,12}};
+                ggml_backend_tensor_set(t, rows, 0, sizeof(rows));
+            } else {
+                init_tensor_uniform(t);
+                if (strcmp(t->name, "as") == 0) {
+                    std::vector<uint8_t> zero(t->nb[2], 0);
+                    ggml_backend_tensor_set(t, zero.data(), 12*t->nb[2], zero.size());
+                }
+            }
+        }
+    }
+};
+
+// FreeToken hybrid correctness: one MUL_MAT_ID chooses per expert between
+// cold source and byte-identical hot cache slots via src[3]/src[4].
+struct test_mul_mat_id_moe_hybrid : public test_case {
+    std::string vars() override { return std::getenv("GGML_TEST_HYBRID_IQ2S") ? "iq2_s,top8,n2,hot4" : "iq3_xxs,top8,n2,hot4"; }
+    double max_nmse_err() override { return 5e-4; }
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_MOE_HYBRID"; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        constexpr int n_mats = 16, n_used = 8, n_hot = 4;
+        const ggml_type hyb_type = std::getenv("GGML_TEST_HYBRID_IQ2S") ? GGML_TYPE_IQ2_S : GGML_TYPE_IQ3_XXS;
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, hyb_type, 256, 512, n_mats);
+        ggml_set_name(as, "hyb_as");
+        ggml_tensor * hot = ggml_new_tensor_3d(ctx, hyb_type, 256, 512, n_hot + 1);
+        ggml_set_name(hot, "hyb_hot");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, 2);
+        ggml_set_name(ids, "hyb_ids");
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, n_used, 2);
+        ggml_set_name(b, "hyb_b");
+        ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
+        out->src[3] = std::getenv("GGML_TEST_HYBRID_ALIAS_COLD") ? as : hot;
+        const int32_t raw = n_hot + 1;
+        out->op_params[4] = raw;
+        ggml_set_name(out, "hyb_out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        constexpr int n_hot = 4;
+        ggml_tensor * as = nullptr;
+        ggml_tensor * hot = nullptr;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "hyb_ids") == 0) {
+                const int32_t orig[2][8] = {{0,5,1,6,2,7,3,8},{4,9,0,10,1,11,2,12}};
+                int32_t rows[2][8];
+                const bool all_miss = std::getenv("GGML_TEST_HYBRID_ALL_MISS") != nullptr;
+                for (int r = 0; r < 2; ++r) {
+                    for (int c = 0; c < 8; ++c) {
+                        const int32_t ex = orig[r][c];
+                        const uint32_t slot = (!all_miss && ex < n_hot) ? (uint32_t) ex : 0xffffu;
+                        rows[r][c] = (int32_t) ((((uint32_t) ex) << 16) | slot);
+                    }
+                }
+                ggml_backend_tensor_set(t, rows, 0, sizeof(rows));
+            } else {
+                init_tensor_uniform(t);
+                if (strcmp(t->name, "hyb_as") == 0) as = t;
+                if (strcmp(t->name, "hyb_hot") == 0) hot = t;
+            }
+        }
+        GGML_ASSERT(as && hot);
+        std::vector<uint8_t> tmp(as->nb[2]);
+        for (int e = 0; e < n_hot; ++e) {
+            ggml_backend_tensor_get(as, tmp.data(), (size_t)e*as->nb[2], tmp.size());
+            ggml_backend_tensor_set(hot, tmp.data(), (size_t)e*hot->nb[2], tmp.size());
+        }
     }
 };
 
@@ -9367,6 +9465,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1));
+    // Tiel Qwen3.5-MoE MTP verify: top-8, 2-token batch. With GGML_TEST_DUP_IDS=1 this reproduces
+    // the cache dummy-slot duplicate-ID correctness bug seen on Vulkan/Polaris.
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 16, 8, false, 512, 2, 256));
+    test_cases.emplace_back(new test_mul_mat_id_moe_skip());
+    test_cases.emplace_back(new test_mul_mat_id_moe_hybrid());
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
 
     // gpt-oss issue with Vulkan mmq_id
