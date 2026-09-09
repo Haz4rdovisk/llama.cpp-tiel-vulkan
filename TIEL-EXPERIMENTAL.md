@@ -10,6 +10,7 @@ Base commit: `bccbacdb8945680f1cfc7e6bffd1e59014705750`, the expert-cache branch
 - Packed expert/slot IDs; IQ2_S gate/up and IQ3_XXS down kernels.
 - Per-layer adaptive cache, small target/MTP batches up to four, publication at graph boundaries.
 - K24 base residency plus a prefill-aware 16-slot per-layer decode bank (K40 effective), allocated only when scheduler/device budgets preserve a 128 MiB VRAM reserve and revoked before prefill returns.
+- Optional profiled redistribution keeps exactly 416 transient slots but varies them by layer through `LLAMA_MOE_CACHE_EXTRA_PLAN`; an invalid plan preserves K24 rather than allocating an ambiguous bank.
 - Source-generated, tested banked Vulkan SPIR-V and a seven-binding dispatch that selects cold host, base VRAM or extra-bank VRAM weights without a CPU/GPU merge.
 - Normal non-hybrid scheduling for prefill; optional tool-message checkpoints for incremental prompts.
 - Hardware scope: RX590 8GB, i7-7700, one model/slot. Not a complete implementation of every FreeToken/ATSInfer technique.
@@ -31,6 +32,8 @@ Gate/up use IQ2_S, down uses IQ3_XXS for this model. The cache copies quantized 
 The candidate has 26 host layers x 24 base slots = 624 complete gate/up/down expert entries, about 638.625 MiB of quantized weight cache, excluding tables and scratch buffers. After a real prefill-to-decode transition it may add 16 slots per layer (416 entries, 446,431,232 bytes), yielding effective K40 and about 1,064.375 MiB of expert weights. Server warmup alone cannot trigger this bank. The allocation budget is the greater of the scheduler phase-arena release and reliable Vulkan free-memory reporting minus a fixed 128 MiB reserve. Reports with `free == total` are treated as unreliable. Failure to allocate leaves K24 active; returning to prefill revokes only the transient bank. Capacity changes only at the synchronized PP/TG boundary; LRU residency changes at runtime. Optional recent-frequency admission exists, but the measured default remains uniform per-layer LRU. This is not an online bandwidth-aware placement solver or the paper's fully elastic global cache.
 
 The base/extra split is a shader ABI. `ggml_backend_tiel_banked_abi` is published through the Vulkan backend registry and checked before allocating the extra bank. A mismatched rebuilt Vulkan library therefore disables K40 rather than silently interpreting packed extra-slot IDs with the wrong shader. All six banked IQ2_S/IQ3_XXS variants are generated from tracked GLSL by the normal Vulkan shader generator; no opaque prebuilt SPIR-V header is required. A fresh build produced byte-identical SPIR-V to the approved K32 runtime artifacts and passed `spirv-val`.
+
+The profiled successor uses total per-layer capacities `32,30,31,35,49,35,43,36,35,43,38,58,45,43,33,40,34,44,41,34,39,42,42,46,48,44`. K24 remains the base; only the same 416 transient slots are redistributed. Omitting the variable retains uniform K40.
 
 `llama_moe_cache_init/free` track ownership and clean up failed initialization; model destruction releases the owning cache. Captured routes avoid the profiler's per-node host synchronization. The candidate remains scoped to one model/slot; ownership checks do not establish unrestricted multi-model concurrency.
 
@@ -59,7 +62,7 @@ Primary references, checked against the papers rather than Reddit commentary:
 | FreeToken prefill transfer/computation double buffering | Not integrated; normal prefill scheduling retained. |
 | FreeToken semantic-boundary recurrent-state reuse | Narrow adaptation: TOOL boundaries in existing llama.cpp checkpoints, not the complete paper policy. |
 | FreeToken elastic cache resizing and loading layout | Partial, bounded adaptation: a synchronized K24-to-K40 per-layer bank follows the prefill/decode phase and reliable Vulkan memory budget, preserves 128 MiB, and falls back to K24. No continuous resizing, global pool or FTW layout. |
-| ATSInfer profiled tensor placement with memory and switching costs | Not implemented as a solver; host26 is an explicitly selected placement. |
+| ATSInfer profiled tensor placement with memory and switching costs | Narrow offline adaptation: measured routes drive a fixed host26 extra-slot plan under the same memory budget. No online solver or tensor switching policy. |
 | ATSInfer load-aware dynamic transfer and asynchronous CPU/GPU coordination | Not integrated as a general runtime scheduler. |
 
 These comparisons describe inspiration and differences, not an official port or reproduction of either paper's speedups. The starting expert-cache implementation is the csantiago78 branch named above; the single-dispatch kernel and scheduler integration are the adaptation here.
@@ -76,6 +79,7 @@ Hardware-driven exclusions from our own experiments: the dual CPU/GPU FFN chains
 | Router-stable K32 | Keeps router logits alive for cached batches so K24/K32 use the same safe graph lifetime; fixed-sequence logits and a 512-token MTP run matched exactly. |
 | Current consolidation | Removed rejected cache modes, prefill-copy and per-layer slot-plan runtime code; retained explicit negative policy tests. Added phase-banked capacity, checkpoint isolation and the Vulkan banked-ABI capability check. |
 | K40 promotion | Expanded only the transient bank to 16 slots/layer, gated it on real prefill, added reliable Vulkan-budget handling and retained a 128 MiB reserve. Two controlled 512-token runs preserved K32 output/MTP while improving decode and wall time. |
+| Profiled K40 redistribution | Dynamic programming over current routes redistributed the same 416 transient slots. Replay removed 445 misses (0.83%); clean TG was 35.54 with exact K40 output/MTP and no extra VRAM. |
 
 The completed coding task and prior quality checks are accepted evidence; this consolidation does not request repeating them. They do not imply every possible task or context length is correct. The short 128-token completion is a separate regression check, not a completed coding task.
 
@@ -123,6 +127,8 @@ Server options:
 Also supply `-ot` with 26 comma-separated overrides, one for each layer 0 through 25:
 `blk\.N\.ffn_(up|down|gate|gate_up)_(ch|)exps=Vulkan_Host`, replacing N with each layer number. Do not assume `-ncmoe` alone reproduces this explicit placement. Adaptive initialization should report `FREETOKEN_ACTIVE layers=26 loaded=0 slots=24 enabled=1`; zero loaded is expected before adaptive admission. On the decode transition, a matching K40 runtime reports exactly one `TIEL_PHASE_BUDGET ... reliable=1 reserve=134217728 ...` followed by `FREETOKEN_EXTRA active=1 layers=26 slots=16 bytes=446431232`. Absence of the second line means safe K24 fallback, not a K40 benchmark. A disabled cache or `backend_abi_unavailable` run is invalid cache evidence.
 
+The profiled profile additionally sets `LLAMA_MOE_CACHE_EXTRA_PLAN=8,6,7,11,25,11,19,12,11,19,14,34,21,19,9,16,10,20,17,10,15,18,18,22,24,20`. `FREETOKEN_EXTRA_PLAN total=416` confirms acceptance. Without it, K40 remains uniform.
+
 Keep only one GPU server active. Bind locally unless deliberately configuring remote access. CPU/GPU frequency policy affects measurements; no privileged power helper is bundled. Context 65536 specifies capacity, not validation at a full 64K prompt.
 
 ## Evidence and limitations
@@ -137,6 +143,7 @@ Historical short measurements (not repeated during publication):
 | Router-stable K32, 512 generated | 188.83 | 34.50 |
 | Host26/K40 proof, 512 generated | 188.28 | 35.57 |
 | Host26/K40 promotion validation, 512 generated | 189.91 | 35.18 |
+| Host26/profiled-K40 validation, 512 generated | 188.25 | 35.54 |
 
 The first two rows used different configurations and are not a statistical estimate of speedup. The paired K24/K32 rows used the same corrected runtime: K32 improved TG 2.78% and wall 1.92%, with identical output SHA256 and MTP 240/271. The K40 rows used the same K32 prompt, seed and greedy output contract; both retained SHA256 `360c18cfe36f0a75ab97d2eeeb2a45a13c1a59617d45a00d9b17bf14dd496266`, 1,922 characters and MTP 240/271. K40 wall was 19.971 s and 20.082 s versus 20.391 s for K32. These bounded runs are not confidence intervals. An earlier hybrid achieved TG28.99 but PP51.68 and worse wall time; it is not the candidate prefill architecture.
 
@@ -156,11 +163,15 @@ The initial publication did not run a fresh benchmark. The marker follow-up was 
 
 K40 promotion reused the accepted K32 banked shaders. Its external host-buffer contracts covered IQ2_S and IQ3_XXS with 96 adaptive updates, real extra-bank routes, exact copied weights/maps/outputs, revocation, three reloads and cleanup. The final source build passed all five checkpoint integrity tests and one controlled model run; no K sweep was performed. Host27/K40 was valid but inferior and was not promoted. A warmup-triggered trial decoded at K24 and is explicitly excluded from K40 results.
 
+For per-layer redistribution, a first plan derived from older traces regressed the current measured hit rate from 52.800% to 52.583% and was rejected. Temporary tracing then captured the current route sequence; its optimized plan replayed at 53.048% versus 52.656% uniform, removing 445 misses. Route-trace code was removed before promotion. The clean run matched the best uniform K40 within noise, so the throughput delta is not claimed as statistically isolated; the demonstrated gain is fewer cold PCIe routes under an unchanged memory budget.
+
 ## Provenance pins
 
 The immutable source tag `checkpoint/rx590-k32-source-complete-20260908` identifies the cleaned, rebuildable K32 source checkpoint. The separately saved local runtime checkpoint contains its own SHA256 manifest and complete dynamic-library set; binaries, the GGUF model, profiles and private benchmark payloads are not distributed in this repository.
 
 The accepted successor tag `checkpoint/rx590-k40-prefill-aware-20260909` adds only the prefill-aware 16-slot transient bank and guarded Vulkan memory budget. Its private runtime checkpoint is `/home/lucas/.local/state/tiel-agentic-dev/checkpoints/k40-prefill-aware-20260909`; verification matched commit `68e876f01` and 27 saved files. K32 remains immutable as the immediate rollback.
+
+The profiled successor tag `checkpoint/rx590-k40-profiled-slots-20260909` adds the validated per-layer plan interface. Its private runtime checkpoint verifies commit `e79184ecf` and 27 saved files. Uniform K40 remains its immediate rollback.
 
 The earlier immutable tag `checkpoint/rx590-k32-router-stable-20260907` is retained for audit but is not a complete source rollback: it omitted the banked Vulkan source/header while the saved runtime already contained that backend. Do not deploy or rebuild K32 from that tag. It was not moved or force-updated; this follow-up restores the exact approved backend source and has its own replacement tag.
 
@@ -178,11 +189,11 @@ The mode test expects 14 `REJECT ... PASS` lines and 14 `only_vulkan_host_mode_s
 
 ## Rollback contract: prepare before changing anything
 
-Accepted source checkpoint: immutable tag `checkpoint/rx590-k40-prefill-aware-20260909`. The prior `checkpoint/rx590-k32-source-complete-20260908` tag remains the immediate rollback. Never move or force-push a checkpoint tag. To recover K40 source without deleting current work:
+Accepted source checkpoint: immutable tag `checkpoint/rx590-k40-profiled-slots-20260909`. Uniform `checkpoint/rx590-k40-prefill-aware-20260909` remains the immediate rollback, followed by K32. Never move or force-push a checkpoint tag. To recover profiled K40 source without deleting current work:
 
 ```sh
 git fetch origin --tags
-git worktree add --detach ../llama-tiel-checkpoint checkpoint/rx590-k40-prefill-aware-20260909
+git worktree add --detach ../llama-tiel-checkpoint checkpoint/rx590-k40-profiled-slots-20260909
 ```
 
 Build that worktree into a new directory, not an existing DEV/production build. A Git tag alone cannot restore a specific dynamically linked runtime. Before each implementation/build/profile change, use the local-only helper:

@@ -24,6 +24,34 @@ bool cache_env_enabled(const char * name) {
     return value && std::strcmp(value, "1") == 0;
 }
 
+std::vector<int32_t> extra_slot_plan(size_t n_layers, int32_t uniform_slots) {
+    const char * value = std::getenv("LLAMA_MOE_CACHE_EXTRA_PLAN");
+    if (!value || !*value) {
+        return std::vector<int32_t>(n_layers, uniform_slots);
+    }
+    std::vector<int32_t> plan;
+    std::istringstream input(value);
+    std::string item;
+    int64_t total = 0;
+    while (std::getline(input, item, ',')) {
+        try {
+            size_t parsed = 0;
+            const long slots = std::stol(item, &parsed);
+            if (parsed != item.size() || slots <= 0 || slots > 256) {
+                return {};
+            }
+            plan.push_back((int32_t) slots);
+            total += slots;
+        } catch (...) {
+            return {};
+        }
+    }
+    if (plan.size() != n_layers || total != (int64_t) n_layers * uniform_slots) {
+        return {};
+    }
+    return plan;
+}
+
 struct layer_state {
     llama_moe_cache_layer pub;
 
@@ -538,6 +566,11 @@ size_t llama_moe_cache_extra(const llama_model & model, int32_t slots, size_t bu
         return 0;
     }
     if (slots != 16 || mc->layers.empty() || mc->extra_buffer) return 0;
+    const std::vector<int32_t> plan = extra_slot_plan(mc->layers.size(), slots);
+    if (plan.empty()) {
+        fprintf(stderr, "FREETOKEN_EXTRA disabled=1 reason=invalid_extra_plan base_preserved=1\n");
+        return 0;
+    }
     const auto buft = ggml_backend_buffer_get_type(mc->layers.front().pub.up_c->buffer);
     const auto device = ggml_backend_buft_get_device(buft);
     const auto reg = device ? ggml_backend_dev_backend_reg(device) : nullptr;
@@ -549,23 +582,29 @@ size_t llama_moe_cache_extra(const llama_model & model, int32_t slots, size_t bu
         return 0;
     }
     size_t required=0;
-    for (auto & ls : mc->layers) {
+    for (size_t li = 0; li < mc->layers.size(); ++li) {
+        auto & ls = mc->layers[li];
         auto & p=ls.pub;
-        if (p.n_slots+slots > p.up_src->ne[2] || p.n_slots >= 0x8000 ||
+        const int32_t layer_slots = plan[li];
+        if (p.n_slots+layer_slots > p.up_src->ne[2] || p.n_slots >= 0x8000 ||
             ggml_backend_buffer_get_type(p.up_c->buffer)!=buft) return 0;
-        required += size_t(slots)*(p.up_src->nb[2]+p.gate_src->nb[2]+p.down_src->nb[2]);
+        required += size_t(layer_slots)*(p.up_src->nb[2]+p.gate_src->nb[2]+p.down_src->nb[2]);
     }
     if (required > budget) return 0;
     // Reserve host metadata before allocating or publishing GPU storage.
-    for (auto & ls : mc->layers) {
-        ls.slot_expert.reserve(ls.pub.n_slots+slots);
-        ls.slot_last_use.reserve(ls.pub.n_slots+slots);
+    for (size_t li = 0; li < mc->layers.size(); ++li) {
+        auto & ls = mc->layers[li];
+        ls.slot_expert.reserve(ls.pub.n_slots+plan[li]);
+        ls.slot_last_use.reserve(ls.pub.n_slots+plan[li]);
     }
     auto * ctx=ggml_init({ggml_tensor_overhead()*(mc->layers.size()*3+8),nullptr,true});
     if (!ctx) return 0;
     std::vector<ggml_tensor *> tensors;
-    for (auto & ls : mc->layers) for (auto * src : {ls.pub.up_src,ls.pub.gate_src,ls.pub.down_src}) {
-        tensors.push_back(ggml_new_tensor_3d(ctx,src->type,src->ne[0],src->ne[1],slots));
+    for (size_t li = 0; li < mc->layers.size(); ++li) {
+        auto & ls = mc->layers[li];
+        for (auto * src : {ls.pub.up_src,ls.pub.gate_src,ls.pub.down_src}) {
+            tensors.push_back(ggml_new_tensor_3d(ctx,src->type,src->ne[0],src->ne[1],plan[li]));
+        }
     }
     auto * buffer=ggml_backend_alloc_ctx_tensors_from_buft(ctx,buft);
     if (!buffer) { ggml_free(ctx); fprintf(stderr,"FREETOKEN_EXTRA allocation_failed=1 base_preserved=1\n"); return 0; }
@@ -574,11 +613,16 @@ size_t llama_moe_cache_extra(const llama_model & model, int32_t slots, size_t bu
     }
     mc->extra_ctx=ctx;mc->extra_buffer=buffer;
     size_t i=0;
-    for (auto & ls : mc->layers) {
+    for (size_t li = 0; li < mc->layers.size(); ++li) {
+        auto & ls = mc->layers[li];
         auto & p=ls.pub;
-        p.up_extra=tensors[i++];p.gate_extra=tensors[i++];p.down_extra=tensors[i++];p.n_extra_slots=slots;
-        ls.slot_expert.resize(p.n_slots+slots,-1);ls.slot_last_use.resize(p.n_slots+slots,0);
+        const int32_t layer_slots = plan[li];
+        p.up_extra=tensors[i++];p.gate_extra=tensors[i++];p.down_extra=tensors[i++];p.n_extra_slots=layer_slots;
+        ls.slot_expert.resize(p.n_slots+layer_slots,-1);ls.slot_last_use.resize(p.n_slots+layer_slots,0);
     }
+    fprintf(stderr, "FREETOKEN_EXTRA_PLAN total=%zu slots=", mc->layers.size() * (size_t) slots);
+    for (size_t li = 0; li < plan.size(); ++li) fprintf(stderr, "%s%d", li ? "," : "", plan[li]);
+    fprintf(stderr, "\n");
     fprintf(stderr,"FREETOKEN_EXTRA active=1 layers=%zu slots=%d bytes=%zu\n",mc->layers.size(),slots,ggml_backend_buffer_get_size(buffer));
     return ggml_backend_buffer_get_size(buffer);
 }
