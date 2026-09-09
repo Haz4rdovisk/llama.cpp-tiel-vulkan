@@ -537,7 +537,7 @@ size_t llama_moe_cache_extra(const llama_model & model, int32_t slots, size_t bu
         fprintf(stderr,"FREETOKEN_EXTRA revoked=1 base_preserved=1\n");
         return 0;
     }
-    if (slots != 8 || mc->layers.empty() || mc->extra_buffer) return 0;
+    if (slots != 16 || mc->layers.empty() || mc->extra_buffer) return 0;
     const auto buft = ggml_backend_buffer_get_type(mc->layers.front().pub.up_c->buffer);
     const auto device = ggml_backend_buft_get_device(buft);
     const auto reg = device ? ggml_backend_dev_backend_reg(device) : nullptr;

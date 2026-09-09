@@ -348,6 +348,7 @@ private:
     bool phase_arena_checked = false;
     bool phase_arena_enabled = false;
     bool phase_arena_decode = false;
+    bool phase_arena_prefill_seen = false;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

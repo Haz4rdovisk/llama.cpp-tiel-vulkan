@@ -1,15 +1,15 @@
 # Tiel Vulkan experimental snapshot
 
-This private development snapshot preserves the cleaned K32 RX590 checkpoint. It is not a production release or an upstream submission. Code was developed with AI assistance under user direction. Original authorship, history and licenses remain intact.
+This private development snapshot preserves the cleaned K40 RX590 checkpoint. It is not a production release or an upstream submission. Code was developed with AI assistance under user direction. Original authorship, history and licenses remain intact.
 
-Base commit: `bccbacdb8945680f1cfc7e6bffd1e59014705750`, the expert-cache branch by csantiago78, on top of llama.cpp. This branch contains the cleaned single-dispatch adaptation, phase-safe K24/K32 capacity, router-stability fix and checkpoint tooling. Production was not changed.
+Base commit: `bccbacdb8945680f1cfc7e6bffd1e59014705750`, the expert-cache branch by csantiago78, on top of llama.cpp. This branch contains the cleaned single-dispatch adaptation, phase-safe K24/K40 capacity, router-stability fix and checkpoint tooling. Production was not changed.
 
 ## Candidate architecture
 
 - Single Vulkan MUL_MAT_ID dispatch with cold host weights and hot VRAM weights; no second CPU/GPU chain in the candidate path.
 - Packed expert/slot IDs; IQ2_S gate/up and IQ3_XXS down kernels.
 - Per-layer adaptive cache, small target/MTP batches up to four, publication at graph boundaries.
-- K24 base residency plus an eight-slot per-layer decode bank (K32 effective), allocated only after the prefill arena is released and revoked before prefill returns.
+- K24 base residency plus a prefill-aware 16-slot per-layer decode bank (K40 effective), allocated only when scheduler/device budgets preserve a 128 MiB VRAM reserve and revoked before prefill returns.
 - Source-generated, tested banked Vulkan SPIR-V and a seven-binding dispatch that selects cold host, base VRAM or extra-bank VRAM weights without a CPU/GPU merge.
 - Normal non-hybrid scheduling for prefill; optional tool-message checkpoints for incremental prompts.
 - Hardware scope: RX590 8GB, i7-7700, one model/slot. Not a complete implementation of every FreeToken/ATSInfer technique.
@@ -28,9 +28,9 @@ Gate/up use IQ2_S, down uses IQ3_XXS for this model. The cache copies quantized 
 
 `src/llama-moecache.cpp:llama_moe_cache_update_vulkan` consumes routes captured by the graph into persistent buffers. It batches route readback, waits for graph completion, updates per-layer residency and admits at most the configured number of experts per layer per step. Weight uploads and changed mapping tables complete before the next graph uses them. There is no promised overlap of publication with the next decode step.
 
-The candidate has 26 host layers x 24 base slots = 624 complete gate/up/down expert entries, about 638.625 MiB of quantized weight cache, excluding tables and scratch buffers. During decode, the phase arena can fund another eight slots per layer (about 212.875 MiB), producing K32 effective capacity without keeping the extra bank alive during prefill. Capacity changes only at the synchronized PP/TG boundary; LRU residency changes at runtime. Optional recent-frequency admission exists, but the measured default remains per-layer LRU. This is not an online bandwidth-aware placement solver.
+The candidate has 26 host layers x 24 base slots = 624 complete gate/up/down expert entries, about 638.625 MiB of quantized weight cache, excluding tables and scratch buffers. After a real prefill-to-decode transition it may add 16 slots per layer (416 entries, 446,431,232 bytes), yielding effective K40 and about 1,064.375 MiB of expert weights. Server warmup alone cannot trigger this bank. The allocation budget is the greater of the scheduler phase-arena release and reliable Vulkan free-memory reporting minus a fixed 128 MiB reserve. Reports with `free == total` are treated as unreliable. Failure to allocate leaves K24 active; returning to prefill revokes only the transient bank. Capacity changes only at the synchronized PP/TG boundary; LRU residency changes at runtime. Optional recent-frequency admission exists, but the measured default remains uniform per-layer LRU. This is not an online bandwidth-aware placement solver or the paper's fully elastic global cache.
 
-The base/extra split is a shader ABI. `ggml_backend_tiel_banked_abi` is published through the Vulkan backend registry and checked before allocating the extra bank. A mismatched rebuilt Vulkan library therefore disables K32 rather than silently interpreting packed extra-slot IDs with the wrong shader. All six banked IQ2_S/IQ3_XXS variants are generated from tracked GLSL by the normal Vulkan shader generator; no opaque prebuilt SPIR-V header is required. A fresh build produced byte-identical SPIR-V to the approved K32 runtime artifacts and passed `spirv-val`.
+The base/extra split is a shader ABI. `ggml_backend_tiel_banked_abi` is published through the Vulkan backend registry and checked before allocating the extra bank. A mismatched rebuilt Vulkan library therefore disables K40 rather than silently interpreting packed extra-slot IDs with the wrong shader. All six banked IQ2_S/IQ3_XXS variants are generated from tracked GLSL by the normal Vulkan shader generator; no opaque prebuilt SPIR-V header is required. A fresh build produced byte-identical SPIR-V to the approved K32 runtime artifacts and passed `spirv-val`.
 
 `llama_moe_cache_init/free` track ownership and clean up failed initialization; model destruction releases the owning cache. Captured routes avoid the profiler's per-node host synchronization. The candidate remains scoped to one model/slot; ownership checks do not establish unrestricted multi-model concurrency.
 
@@ -58,7 +58,7 @@ Primary references, checked against the papers rather than Reddit commentary:
 | FreeToken q-star split of misses between CPU execution and GPU cache fills | Not integrated; cold misses are read by the Vulkan kernel. |
 | FreeToken prefill transfer/computation double buffering | Not integrated; normal prefill scheduling retained. |
 | FreeToken semantic-boundary recurrent-state reuse | Narrow adaptation: TOOL boundaries in existing llama.cpp checkpoints, not the complete paper policy. |
-| FreeToken elastic cache resizing and loading layout | Partial, bounded adaptation: synchronized K24/K32 phase bank; no arbitrary online resizing or FTW layout. |
+| FreeToken elastic cache resizing and loading layout | Partial, bounded adaptation: a synchronized K24-to-K40 per-layer bank follows the prefill/decode phase and reliable Vulkan memory budget, preserves 128 MiB, and falls back to K24. No continuous resizing, global pool or FTW layout. |
 | ATSInfer profiled tensor placement with memory and switching costs | Not implemented as a solver; host26 is an explicitly selected placement. |
 | ATSInfer load-aware dynamic transfer and asynchronous CPU/GPU coordination | Not integrated as a general runtime scheduler. |
 
@@ -74,7 +74,8 @@ Hardware-driven exclusions from our own experiments: the dual CPU/GPU FFN chains
 | Development before publication | Packed routes, single-dispatch quant kernels, adaptive residency, narrow scheduler access, pinned-buffer/view fixes, lifecycle checks and optional TOOL checkpoints. Preserved together in initial private commit a40e826e8. |
 | d7fb6792b | Four legacy marker writes fixed; full DEV build and server restart completed. Short output regression: PP187.47, TG32.00, 60/67 MTP, hash identical to prior same-profile output. |
 | Router-stable K32 | Keeps router logits alive for cached batches so K24/K32 use the same safe graph lifetime; fixed-sequence logits and a 512-token MTP run matched exactly. |
-| Current consolidation | Removed rejected cache modes, prefill-copy and per-layer slot-plan runtime code; retained explicit negative policy tests. Added phase K24/K32, checkpoint isolation and the Vulkan banked-ABI capability check. |
+| Current consolidation | Removed rejected cache modes, prefill-copy and per-layer slot-plan runtime code; retained explicit negative policy tests. Added phase-banked capacity, checkpoint isolation and the Vulkan banked-ABI capability check. |
+| K40 promotion | Expanded only the transient bank to 16 slots/layer, gated it on real prefill, added reliable Vulkan-budget handling and retained a 128 MiB reserve. Two controlled 512-token runs preserved K32 output/MTP while improving decode and wall time. |
 
 The completed coding task and prior quality checks are accepted evidence; this consolidation does not request repeating them. They do not imply every possible task or context length is correct. The short 128-token completion is a separate regression check, not a completed coding task.
 
@@ -120,7 +121,7 @@ Server options:
 ```
 
 Also supply `-ot` with 26 comma-separated overrides, one for each layer 0 through 25:
-`blk\.N\.ffn_(up|down|gate|gate_up)_(ch|)exps=Vulkan_Host`, replacing N with each layer number. Do not assume `-ncmoe` alone reproduces this explicit placement. Adaptive initialization should report `FREETOKEN_ACTIVE layers=26 loaded=0 slots=24 enabled=1`; zero loaded is expected before adaptive admission. On the decode transition, a matching runtime reports `FREETOKEN_EXTRA active=1 layers=26 slots=8`. Together these are K32. A disabled cache or `backend_abi_unavailable` run is not a valid K32 benchmark.
+`blk\.N\.ffn_(up|down|gate|gate_up)_(ch|)exps=Vulkan_Host`, replacing N with each layer number. Do not assume `-ncmoe` alone reproduces this explicit placement. Adaptive initialization should report `FREETOKEN_ACTIVE layers=26 loaded=0 slots=24 enabled=1`; zero loaded is expected before adaptive admission. On the decode transition, a matching K40 runtime reports exactly one `TIEL_PHASE_BUDGET ... reliable=1 reserve=134217728 ...` followed by `FREETOKEN_EXTRA active=1 layers=26 slots=16 bytes=446431232`. Absence of the second line means safe K24 fallback, not a K40 benchmark. A disabled cache or `backend_abi_unavailable` run is invalid cache evidence.
 
 Keep only one GPU server active. Bind locally unless deliberately configuring remote access. CPU/GPU frequency policy affects measurements; no privileged power helper is bundled. Context 65536 specifies capacity, not validation at a full 64K prompt.
 
@@ -134,8 +135,10 @@ Historical short measurements (not repeated during publication):
 | Host26/K24/64K candidate | 186.60 | 31.99 |
 | Router-stable K24 control, 512 generated | 189.25 | 33.57 |
 | Router-stable K32, 512 generated | 188.83 | 34.50 |
+| Host26/K40 proof, 512 generated | 188.28 | 35.57 |
+| Host26/K40 promotion validation, 512 generated | 189.91 | 35.18 |
 
-The first two rows used different configurations and are not a statistical estimate of speedup. The paired K24/K32 rows used the same corrected runtime: K32 improved TG 2.78% and wall 1.92%, with identical output SHA256 and MTP 240/271. One sample is not a confidence interval. An earlier hybrid achieved TG28.99 but PP51.68 and worse wall time; it is not the candidate prefill architecture.
+The first two rows used different configurations and are not a statistical estimate of speedup. The paired K24/K32 rows used the same corrected runtime: K32 improved TG 2.78% and wall 1.92%, with identical output SHA256 and MTP 240/271. The K40 rows used the same K32 prompt, seed and greedy output contract; both retained SHA256 `360c18cfe36f0a75ab97d2eeeb2a45a13c1a59617d45a00d9b17bf14dd496266`, 1,922 characters and MTP 240/271. K40 wall was 19.971 s and 20.082 s versus 20.391 s for K32. These bounded runs are not confidence intervals. An earlier hybrid achieved TG28.99 but PP51.68 and worse wall time; it is not the candidate prefill architecture.
 
 With adaptive cache active on both sides, one USER-only versus TOOL-checkpoint A/B reduced the incremental request wall from 11.39591s to 6.58736s. Reused tokens increased 603 to 1601. Extracted code matched and passed 36 cases; generated message lengths differed. This does not prove universal agent speedup. A later 9553-token prompt test is not full-context qualification. Do not add gains from different experiments.
 
@@ -151,9 +154,13 @@ Only explicit LLAMA_MOE_CACHE_MODE=vulkan_host is accepted when requesting a pos
 
 The initial publication did not run a fresh benchmark. The marker follow-up was built, deployed and checked with one 128-token completion. Consolidation was built and tested with 14 rejected-mode/opt-in combinations, then the existing synthetic Vulkan adaptive tests: 12 updates and 3 reloads each for IQ2_S and IQ3_XXS with batch4. No new coding-task run or complete backend suite was needed for this initialization gate. Existing benchmark values remain historical, not newly claimed gains from consolidation.
 
+K40 promotion reused the accepted K32 banked shaders. Its external host-buffer contracts covered IQ2_S and IQ3_XXS with 96 adaptive updates, real extra-bank routes, exact copied weights/maps/outputs, revocation, three reloads and cleanup. The final source build passed all five checkpoint integrity tests and one controlled model run; no K sweep was performed. Host27/K40 was valid but inferior and was not promoted. A warmup-triggered trial decoded at K24 and is explicitly excluded from K40 results.
+
 ## Provenance pins
 
 The immutable source tag `checkpoint/rx590-k32-source-complete-20260908` identifies the cleaned, rebuildable K32 source checkpoint. The separately saved local runtime checkpoint contains its own SHA256 manifest and complete dynamic-library set; binaries, the GGUF model, profiles and private benchmark payloads are not distributed in this repository.
+
+The accepted successor tag `checkpoint/rx590-k40-prefill-aware-20260909` adds only the prefill-aware 16-slot transient bank and guarded Vulkan memory budget. Its private runtime checkpoint is `/home/lucas/.local/state/tiel-agentic-dev/checkpoints/k40-prefill-aware-20260909`; verification matched commit `68e876f01` and 27 saved files. K32 remains immutable as the immediate rollback.
 
 The earlier immutable tag `checkpoint/rx590-k32-router-stable-20260907` is retained for audit but is not a complete source rollback: it omitted the banked Vulkan source/header while the saved runtime already contained that backend. Do not deploy or rebuild K32 from that tag. It was not moved or force-updated; this follow-up restores the exact approved backend source and has its own replacement tag.
 
@@ -171,11 +178,11 @@ The mode test expects 14 `REJECT ... PASS` lines and 14 `only_vulkan_host_mode_s
 
 ## Rollback contract: prepare before changing anything
 
-Source checkpoint: immutable tag `checkpoint/rx590-k32-source-complete-20260908`. Never move or force-push a checkpoint tag. To recover source without deleting current work:
+Accepted source checkpoint: immutable tag `checkpoint/rx590-k40-prefill-aware-20260909`. The prior `checkpoint/rx590-k32-source-complete-20260908` tag remains the immediate rollback. Never move or force-push a checkpoint tag. To recover K40 source without deleting current work:
 
 ```sh
 git fetch origin --tags
-git worktree add --detach ../llama-tiel-checkpoint checkpoint/rx590-k32-source-complete-20260908
+git worktree add --detach ../llama-tiel-checkpoint checkpoint/rx590-k40-prefill-aware-20260909
 ```
 
 Build that worktree into a new directory, not an existing DEV/production build. A Git tag alone cannot restore a specific dynamically linked runtime. Before each implementation/build/profile change, use the local-only helper:
@@ -198,6 +205,6 @@ python /absolute/checkpoints/unique-name/checkpoint.py start /absolute/checkpoin
 
 Limits: GGUF model, driver, system libraries, OS, power settings and KV state are not included. A changed OS/driver may require additional recovery; the saved CMake cache is provenance, not portable build configuration. Hash verification proves saved-file identity, not inference quality. Keep the model unchanged and preserve benchmark evidence alongside the private checkpoint. Do not claim a restore succeeded until health and library paths are checked.
 
-K32 checkpoint verification performed: 28 saved files matched their manifest, `ldd` selected the saved inference libraries, the saved executable ran `--version`, and the restored runtime reached healthy state on DEV port 8081. Five no-GPU integrity tests cover corruption, missing files, an escaping manifest path and the checkpoint/start safety contract. A fresh isolated source build passed the K32 host-buffer contract for IQ2_S and IQ3_XXS: 96 adaptive updates, extra-bank accesses, byte-exact resident weights/maps, output equality, revocation and three reloads. The replacement immutable source tag and saved runtime are independent rollback anchors.
+K32 checkpoint verification performed: 28 saved files matched their manifest, `ldd` selected the saved inference libraries, the saved executable ran `--version`, and the restored runtime reached healthy state on DEV port 8081. K40 runtime verification matched 27 files, selected its saved inference libraries and pinned source commit `68e876f01`. Five no-GPU integrity tests cover corruption, missing files, an escaping manifest path and the checkpoint/start safety contract. A fresh isolated source build passed the banked host-buffer contract for IQ2_S and IQ3_XXS: 96 adaptive updates, extra-bank accesses, byte-exact resident weights/maps, output equality, revocation and three reloads. K32 and K40 source tags and saved runtimes are independent rollback anchors.
 
 For every future change: create/tag a checkpoint first; state scope and rollback target; change one mechanism; perform the smallest relevant regression check; publish only after reporting results; never silently advance the accepted checkpoint or repeat completed coding tasks without a reason.

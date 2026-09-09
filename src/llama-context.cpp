@@ -601,6 +601,9 @@ bool llama_context::sched_prepare_phase(uint32_t n_tokens) {
         return true;
     }
     const bool next_decode = n_tokens <= 4;
+    if (!next_decode) {
+        phase_arena_prefill_seen = true;
+    }
     if (next_decode == phase_arena_decode) {
         return true;
     }
@@ -641,10 +644,31 @@ bool llama_context::sched_prepare_phase(uint32_t n_tokens) {
             after += ggml_backend_sched_get_buffer_size(sched.get(), backend);
         }
     }
-    if (phase_arena_decode && extra_enabled && before > after + 32*1024*1024) {
+    if (phase_arena_decode && phase_arena_prefill_seen && extra_enabled && before > after + 32*1024*1024) {
         // Keep a margin; a failed expansion leaves the base cache usable.
         try {
-            const size_t bytes=llama_moe_cache_extra(model, 8, before-after-32*1024*1024);
+            const size_t phase_budget = before - after - 32*1024*1024;
+            size_t memory_free = 0;
+            size_t memory_total = 0;
+            for (auto * backend : backend_ptrs) {
+                if (std::strcmp(ggml_backend_name(backend), "Vulkan0") == 0) {
+                    ggml_backend_dev_memory(ggml_backend_get_device(backend), &memory_free, &memory_total);
+                    break;
+                }
+            }
+            const size_t memory_reserve = 128*1024*1024;
+            // Without VK_EXT_memory_budget, some Vulkan drivers report the heap size as
+            // both free and total. In that case the device figure is not an allocation
+            // budget, so retain the scheduler-derived phase budget instead.
+            const bool memory_budget_reliable = memory_total > 0 && memory_free < memory_total;
+            const size_t device_budget = memory_budget_reliable && memory_free > memory_reserve
+                ? memory_free - memory_reserve
+                : 0;
+            const size_t budget = phase_budget > device_budget ? phase_budget : device_budget;
+            std::fprintf(stderr,
+                "TIEL_PHASE_BUDGET phase=%zu device_free=%zu device_total=%zu reliable=%d reserve=%zu selected=%zu\n",
+                phase_budget, memory_free, memory_total, memory_budget_reliable ? 1 : 0, memory_reserve, budget);
+            const size_t bytes=llama_moe_cache_extra(model, 16, budget);
             if (bytes) {
                 gf_res_prev->reset();gf_res_reserve->reset();
                 ggml_backend_sched_reset(sched.get());
