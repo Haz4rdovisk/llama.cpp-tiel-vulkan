@@ -2004,6 +2004,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         logits = ggml_add(ctx0, logits, gate_inp_b);
         cb(logits, "ffn_moe_logits_biased", il);
     }
+    // Keep routing input disjoint from fused top-k outputs during cached decode.
+    // Cache capacity must not change the router's numerical execution path.
+    if (n_tokens <= 4 && llama_moe_cache_lookup(up_exps)) {
+        ggml_set_output(logits);
+    }
 
     ggml_tensor * probs = nullptr;
     switch (gating_op) {
@@ -2123,11 +2128,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
-    // Small-batch expert cache. Vulkan-host uses packed IDs and one hybrid op;
-    // legacy modes use separate cold and cache chains.
+    // Small-batch expert cache uses packed IDs and one hybrid op.
     const llama_moe_cache_layer * mcache = nullptr;
     ggml_tensor * mc_slot_ids = nullptr;
-    ggml_tensor * mc_cold_ids = nullptr;
     ggml_tensor * expert_ids_main = selected_experts;
     if (n_tokens >= 1 && n_tokens <= llama_moe_cache_max_tokens() &&
         !gate_up_exps && gate_exps && down_exps &&
@@ -2152,21 +2155,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
         mc_slot_ids = ggml_reshape_2d(ctx0, mc_slot_ids, n_expert_used, n_tokens);
         cb(mc_slot_ids, "ffn_moe_cache_slots", il);
-        if (mcache->vulkan_exact) {
-            ggml_tensor * cold_table = ggml_view_4d(ctx0, mcache->cold_table,
-                    1, mcache->cold_table->ne[1], n_tokens, 1,
-                    mcache->cold_table->nb[1], mcache->cold_table->nb[2], mcache->cold_table->nb[3], 0);
-            mc_cold_ids = ggml_get_rows(ctx0, cold_table, selected_experts);
-            mc_cold_ids = ggml_reshape_2d(ctx0, mc_cold_ids, n_expert_used, n_tokens);
-            cb(mc_cold_ids, "ffn_moe_cache_cold_ids", il);
-            expert_ids_main = mc_cold_ids;
-        } else if (mcache->vulkan_host) {
-            expert_ids_main = mc_slot_ids;
-        }
+        expert_ids_main = mc_slot_ids;
     }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
-    ggml_tensor * mc_inp = cur;
 
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
@@ -2199,22 +2191,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        ggml_tensor * up_exps_main = (mcache && mcache->vulkan_import && mcache->up_vk) ? mcache->up_vk : up_exps;
-        up = build_lora_mm_id(up_exps_main, cur, expert_ids_main, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, expert_ids_main, up_exps_s); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
-        if (mcache && mcache->vulkan_host && !mcache->vulkan_exact) {
+        if (mcache) {
             up->src[3] = mcache->up_c;
+            up->src[4] = mcache->up_extra;
+            up->op_params[5] = mcache->n_extra_slots;
             const int32_t hot_slots_raw = mcache->n_slots + 1;
             up->op_params[4] = hot_slots_raw;
-        } else if (mcache && mcache->vulkan_exact) {
-            up->op_params[4] = mcache->cold_dummy + 1;
-            up->src[4] = mcache->up_c;
         }
 
-        if (mcache && !mcache->vulkan_host && !mcache->down_only) {
-            up->src[3] = mcache->host_table;
-            up->op_params[0] = mcache->n_slots;
-        }
 
         if (up_exps_s) {
             cb(up, "ffn_moe_up_scaled", il);
@@ -2226,22 +2212,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            ggml_tensor * gate_exps_main = (mcache && mcache->vulkan_import && mcache->gate_vk) ? mcache->gate_vk : gate_exps;
-            cur = build_lora_mm_id(gate_exps_main, cur, expert_ids_main, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, expert_ids_main, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
-            if (mcache && mcache->vulkan_host && !mcache->vulkan_exact) {
+            if (mcache) {
                 cur->src[3] = mcache->gate_c;
+                cur->src[4] = mcache->gate_extra;
+                cur->op_params[5] = mcache->n_extra_slots;
                 const int32_t hot_slots_raw = mcache->n_slots + 1;
                 cur->op_params[4] = hot_slots_raw;
-            } else if (mcache && mcache->vulkan_exact) {
-                cur->op_params[4] = mcache->cold_dummy + 1;
-                cur->src[4] = mcache->gate_c;
             }
 
-            if (mcache && !mcache->vulkan_host && !mcache->down_only) {
-                cur->src[3] = mcache->host_table;
-                cur->op_params[0] = mcache->n_slots;
-            }
         } else {
             cur = up;
         }
@@ -2343,89 +2323,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         default:
             GGML_ABORT("fatal error");
     }
-
-    ggml_tensor * down_exps_main = (mcache && mcache->vulkan_import && mcache->down_vk) ? mcache->down_vk : down_exps;
-    experts = build_lora_mm_id(down_exps_main, cur, expert_ids_main, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(down_exps, cur, expert_ids_main, down_exps_s); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
-    if (mcache && mcache->vulkan_host && !mcache->vulkan_exact) {
+    if (mcache) {
         experts->src[3] = mcache->down_c;
+        experts->src[4] = mcache->down_extra;
+        experts->op_params[5] = mcache->n_extra_slots;
         const int32_t hot_slots_raw = mcache->n_slots + 1;
         experts->op_params[4] = hot_slots_raw;
-    } else if (mcache && mcache->vulkan_exact) {
-        experts->op_params[4] = mcache->cold_dummy + 1;
-        experts->src[4] = mcache->down_c;
-    }
-
-    if (mcache) {
-        if (!mcache->vulkan_host) {
-            experts->src[3] = mcache->host_table;
-            experts->op_params[0] = mcache->n_slots;
-        }
-
-        const int32_t moe_skip_raw = mcache->n_slots + 1;
-        if (mcache->vulkan_host && !mcache->vulkan_exact) {
-            // Already complete in the three custom hybrid MUL_MAT_ID ops above.
-        } else if (mcache->down_only) {
-            ggml_tensor * down_g = nullptr;
-            // MTP draft decodes cached experts with n_tokens=1. Keep target verify
-            // numerically aligned by running each small-batch token through the same
-            // batch-1 Vulkan MUL_MAT_ID path, then concatenate along token dim.
-            for (int64_t it = 0; it < n_tokens; ++it) {
-                ggml_tensor * cur_t = ggml_view_3d(ctx0, cur,
-                        cur->ne[0], cur->ne[1], 1, cur->nb[1], cur->nb[2], it*cur->nb[2]);
-                ggml_tensor * ids_t = ggml_view_2d(ctx0, mc_slot_ids,
-                        mc_slot_ids->ne[0], 1, mc_slot_ids->nb[1], it*mc_slot_ids->nb[1]);
-                ggml_tensor * part = ggml_mul_mat_id(ctx0, mcache->down_c, cur_t, ids_t);
-                part->op_params[4] = moe_skip_raw;
-                cb(part, "ffn_moe_cache_down_token", il);
-                down_g = down_g ? ggml_concat(ctx0, down_g, part, 2) : part;
-            }
-            cb(down_g, "ffn_moe_cache_down", il);
-            experts = ggml_add(ctx0, experts, down_g);
-            cb(experts, "ffn_moe_cache_merged", il);
-        } else {
-            // Full cache path. Run each small MTP token through the same batch-1
-            // Vulkan expert chain as the draft path, then concatenate. This keeps
-            // target verify numerically aligned with MTP while still serving hits
-            // entirely from VRAM.
-            ggml_tensor * down_g = nullptr;
-            for (int64_t it = 0; it < n_tokens; ++it) {
-                ggml_tensor * inp_t = ggml_view_3d(ctx0, mc_inp,
-                        mc_inp->ne[0], mc_inp->ne[1], 1, mc_inp->nb[1], mc_inp->nb[2], it*mc_inp->nb[2]);
-                ggml_tensor * ids_t = ggml_view_2d(ctx0, mc_slot_ids,
-                        mc_slot_ids->ne[0], 1, mc_slot_ids->nb[1], it*mc_slot_ids->nb[1]);
-
-                ggml_tensor * up_g   = ggml_mul_mat_id(ctx0, mcache->up_c,   inp_t, ids_t);
-                ggml_tensor * gate_g = ggml_mul_mat_id(ctx0, mcache->gate_c, inp_t, ids_t);
-                up_g->op_params[4] = moe_skip_raw;
-                gate_g->op_params[4] = moe_skip_raw;
-
-                ggml_tensor * act_g = nullptr;
-                const float limit = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
-                constexpr float eps = 1e-6f;
-                if (limit > eps) {
-                    up_g = ggml_clamp(ctx0, up_g, -limit, limit);
-                    if (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
-                        gate_g = ggml_clamp(ctx0, gate_g, -INFINITY, limit);
-                        act_g  = ggml_swiglu_split(ctx0, gate_g, up_g);
-                    } else {
-                        ggml_tensor * ga = ggml_silu(ctx0, gate_g);
-                        ga    = ggml_clamp(ctx0, ga, -INFINITY, limit);
-                        act_g = ggml_mul(ctx0, ga, up_g);
-                    }
-                } else {
-                    act_g = ggml_swiglu_split(ctx0, gate_g, up_g);
-                }
-
-                ggml_tensor * part = ggml_mul_mat_id(ctx0, mcache->down_c, act_g, ids_t);
-                part->op_params[4] = moe_skip_raw;
-                cb(part, "ffn_moe_cache_full_token", il);
-                down_g = down_g ? ggml_concat(ctx0, down_g, part, 2) : part;
-            }
-            cb(down_g, "ffn_moe_cache_down", il);
-            experts = ggml_add(ctx0, experts, down_g);
-            cb(experts, "ffn_moe_cache_merged", il);
-        }
     }
 
     if (down_exps_s) {

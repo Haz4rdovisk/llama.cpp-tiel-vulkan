@@ -80,13 +80,18 @@ def main():
         raise RuntimeError('Production port is forbidden')
     with socket.socket() as sock:
         sock.bind((host, port))
-    env = {k: v for k, v in os.environ.items()
-           if not k.startswith(('GGML_VK_', 'LLAMA_MOE_CACHE_', 'LLAMA_SERVER_', 'LD_'))}
-    env.pop('RADV_PERFTEST', None)
-    env.update(profile['env'])
-    env['LD_LIBRARY_PATH'] = str(root / 'bin')
+    env = runtime_environment(os.environ, profile['env'], root)
     print('Starting saved runtime in foreground. Restore host frequency policy separately.', flush=True)
     os.execve(cmd[0], cmd, env)
+
+
+def runtime_environment(inherited, selected, root):
+    env = {k: v for k, v in inherited.items()
+           if not k.startswith(('GGML_VK_', 'LLAMA_MOE_CACHE_', 'LLAMA_SERVER_', 'LLAMA_TIEL_', 'LD_'))}
+    env.pop('RADV_PERFTEST', None)
+    env.update(selected)
+    env['LD_LIBRARY_PATH'] = str(root / 'bin')
+    return env
 
 
 if __name__ == '__main__':

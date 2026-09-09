@@ -54,6 +54,7 @@ struct llama_context {
     //   - changing attention type
     //   - etc.
     void sched_reserve();
+    bool sched_prepare_phase(uint32_t n_tokens);
 
     void synchronize();
 
@@ -344,6 +345,9 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+    bool phase_arena_checked = false;
+    bool phase_arena_enabled = false;
+    bool phase_arena_decode = false;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

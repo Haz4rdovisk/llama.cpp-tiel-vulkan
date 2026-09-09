@@ -19249,11 +19249,26 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+// The split base/extra cache layout changes the packed-slot ABI consumed by
+// the Vulkan MUL_MAT_ID shaders.  Advertise support through the backend
+// registry so llama code never enables the extra bank against a mismatched
+// Vulkan library.
+static int ggml_backend_tiel_banked_abi(ggml_backend_dev_t device) {
+    return device && device->iface.supports_op == ggml_backend_vk_device_supports_op ? 1 : 0;
+}
+
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t, const char * name) {
+    if (std::strcmp(name, "ggml_backend_tiel_banked_abi") == 0) {
+        return reinterpret_cast<void *>(ggml_backend_tiel_banked_abi);
+    }
+    return nullptr;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {

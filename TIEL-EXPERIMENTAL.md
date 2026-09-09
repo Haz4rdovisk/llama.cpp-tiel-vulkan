@@ -1,14 +1,15 @@
 # Tiel Vulkan experimental snapshot
 
-This private development snapshot preserves the RX590 work before further cleanup. It is not a production release or an upstream submission. Code was developed with AI assistance under user direction. Original authorship, history and licenses remain intact.
+This private development snapshot preserves the cleaned K32 RX590 checkpoint. It is not a production release or an upstream submission. Code was developed with AI assistance under user direction. Original authorship, history and licenses remain intact.
 
-Base commit: `bccbacdb8945680f1cfc7e6bffd1e59014705750`, the expert-cache branch by csantiago78, on top of llama.cpp. The initial snapshot preserved 31 DEV implementation files byte-for-byte. The legacy-marker follow-up was also applied to DEV. Production was not changed.
+Base commit: `bccbacdb8945680f1cfc7e6bffd1e59014705750`, the expert-cache branch by csantiago78, on top of llama.cpp. This branch contains the cleaned single-dispatch adaptation, phase-safe K24/K32 capacity, router-stability fix and checkpoint tooling. Production was not changed.
 
 ## Candidate architecture
 
 - Single Vulkan MUL_MAT_ID dispatch with cold host weights and hot VRAM weights; no second CPU/GPU chain in the candidate path.
 - Packed expert/slot IDs; IQ2_S gate/up and IQ3_XXS down kernels.
 - Per-layer adaptive cache, small target/MTP batches up to four, publication at graph boundaries.
+- K24 base residency plus an eight-slot per-layer decode bank (K32 effective), allocated only after the prefill arena is released and revoked before prefill returns.
 - Normal non-hybrid scheduling for prefill; optional tool-message checkpoints for incremental prompts.
 - Hardware scope: RX590 8GB, i7-7700, one model/slot. Not a complete implementation of every FreeToken/ATSInfer technique.
 
@@ -26,7 +27,9 @@ Gate/up use IQ2_S, down uses IQ3_XXS for this model. The cache copies quantized 
 
 `src/llama-moecache.cpp:llama_moe_cache_update_vulkan` consumes routes captured by the graph into persistent buffers. It batches route readback, waits for graph completion, updates per-layer residency and admits at most the configured number of experts per layer per step. Weight uploads and changed mapping tables complete before the next graph uses them. There is no promised overlap of publication with the next decode step.
 
-The candidate has 26 host layers x 24 slots = 624 complete gate/up/down expert entries, about 638.625 MiB of quantized weight cache, excluding tables and scratch buffers. Capacity is fixed at initialization; LRU residency changes at runtime. Optional recent-frequency admission and layer-slot controls exist, but the measured default remains fixed per-layer capacity and LRU. They are not an online bandwidth-aware placement solver.
+The candidate has 26 host layers x 24 base slots = 624 complete gate/up/down expert entries, about 638.625 MiB of quantized weight cache, excluding tables and scratch buffers. During decode, the phase arena can fund another eight slots per layer (about 212.875 MiB), producing K32 effective capacity without keeping the extra bank alive during prefill. Capacity changes only at the synchronized PP/TG boundary; LRU residency changes at runtime. Optional recent-frequency admission exists, but the measured default remains per-layer LRU. This is not an online bandwidth-aware placement solver.
+
+The base/extra split is a shader ABI. `ggml_backend_tiel_banked_abi` is published through the Vulkan backend registry and checked before allocating the extra bank. A mismatched rebuilt Vulkan library therefore disables K32 rather than silently interpreting packed extra-slot IDs with the wrong shader.
 
 `llama_moe_cache_init/free` track ownership and clean up failed initialization; model destruction releases the owning cache. Captured routes avoid the profiler's per-node host synchronization. The candidate remains scoped to one model/slot; ownership checks do not establish unrestricted multi-model concurrency.
 
@@ -54,7 +57,7 @@ Primary references, checked against the papers rather than Reddit commentary:
 | FreeToken q-star split of misses between CPU execution and GPU cache fills | Not integrated; cold misses are read by the Vulkan kernel. |
 | FreeToken prefill transfer/computation double buffering | Not integrated; normal prefill scheduling retained. |
 | FreeToken semantic-boundary recurrent-state reuse | Narrow adaptation: TOOL boundaries in existing llama.cpp checkpoints, not the complete paper policy. |
-| FreeToken elastic cache resizing and loading layout | Not implemented; no automatic reaction to changing free VRAM. |
+| FreeToken elastic cache resizing and loading layout | Partial, bounded adaptation: synchronized K24/K32 phase bank; no arbitrary online resizing or FTW layout. |
 | ATSInfer profiled tensor placement with memory and switching costs | Not implemented as a solver; host26 is an explicitly selected placement. |
 | ATSInfer load-aware dynamic transfer and asynchronous CPU/GPU coordination | Not integrated as a general runtime scheduler. |
 
@@ -69,7 +72,8 @@ Hardware-driven exclusions from our own experiments: the dual CPU/GPU FFN chains
 | Base bccbacdb | Original expert-cache branch; original single-token consumption needed adaptation for MTP. |
 | Development before publication | Packed routes, single-dispatch quant kernels, adaptive residency, narrow scheduler access, pinned-buffer/view fixes, lifecycle checks and optional TOOL checkpoints. Preserved together in initial private commit a40e826e8. |
 | d7fb6792b | Four legacy marker writes fixed; full DEV build and server restart completed. Short output regression: PP187.47, TG32.00, 60/67 MTP, hash identical to prior same-profile output. |
-| Current consolidation | Reject all cache modes except explicit vulkan_host, even with old experimental opt-in. Preserve the active algorithm and add runtime checkpoint tooling and this mechanism map. |
+| Router-stable K32 | Keeps router logits alive for cached batches so K24/K32 use the same safe graph lifetime; fixed-sequence logits and a 512-token MTP run matched exactly. |
+| Current consolidation | Removed rejected cache modes, prefill-copy and per-layer slot-plan runtime code; retained explicit negative policy tests. Added phase K24/K32, checkpoint isolation and the Vulkan banked-ABI capability check. |
 
 The completed coding task and prior quality checks are accepted evidence; this consolidation does not request repeating them. They do not imply every possible task or context length is correct. The short 128-token completion is a separate regression check, not a completed coding task.
 
@@ -96,8 +100,10 @@ GGML_VK_FA_GCN_OCCUPANCY_KB=18
 LLAMA_MOE_CACHE_MODE=vulkan_host
 LLAMA_MOE_CACHE_MAX_TOKENS=4
 LLAMA_MOE_CACHE_ADAPTIVE=1
-LLAMA_MOE_CACHE_ADAPTIVE_STATS=1
 LLAMA_SERVER_TOOL_CHECKPOINTS=1
+LLAMA_TIEL_PHASE_ARENA=1
+LLAMA_TIEL_EXTRA_BANK=1
+GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1
 ```
 
 Server options:
@@ -113,7 +119,7 @@ Server options:
 ```
 
 Also supply `-ot` with 26 comma-separated overrides, one for each layer 0 through 25:
-`blk\.N\.ffn_(up|down|gate|gate_up)_(ch|)exps=Vulkan_Host`, replacing N with each layer number. Do not assume `-ncmoe` alone reproduces this explicit placement. Adaptive initialization should report `FREETOKEN_ACTIVE layers=26 loaded=0 slots=24 enabled=1`; zero loaded is expected before adaptive admission. A disabled cache is not a valid cache benchmark.
+`blk\.N\.ffn_(up|down|gate|gate_up)_(ch|)exps=Vulkan_Host`, replacing N with each layer number. Do not assume `-ncmoe` alone reproduces this explicit placement. Adaptive initialization should report `FREETOKEN_ACTIVE layers=26 loaded=0 slots=24 enabled=1`; zero loaded is expected before adaptive admission. On the decode transition, a matching runtime reports `FREETOKEN_EXTRA active=1 layers=26 slots=8`. Together these are K32. A disabled cache or `backend_abi_unavailable` run is not a valid K32 benchmark.
 
 Keep only one GPU server active. Bind locally unless deliberately configuring remote access. CPU/GPU frequency policy affects measurements; no privileged power helper is bundled. Context 65536 specifies capacity, not validation at a full 64K prompt.
 
@@ -125,37 +131,30 @@ Historical short measurements (not repeated during publication):
 | --- | ---: | ---: |
 | Earlier host24 baseline | 189.48 | 25.12 |
 | Host26/K24/64K candidate | 186.60 | 31.99 |
+| Router-stable K24 control, 512 generated | 189.25 | 33.57 |
+| Router-stable K32, 512 generated | 188.83 | 34.50 |
 
-These used different configurations and are not a statistical estimate of speedup. An earlier hybrid achieved TG28.99 but PP51.68 and worse wall time; it is not the candidate prefill architecture.
+The first two rows used different configurations and are not a statistical estimate of speedup. The paired K24/K32 rows used the same corrected runtime: K32 improved TG 2.78% and wall 1.92%, with identical output SHA256 and MTP 240/271. One sample is not a confidence interval. An earlier hybrid achieved TG28.99 but PP51.68 and worse wall time; it is not the candidate prefill architecture.
 
 With adaptive cache active on both sides, one USER-only versus TOOL-checkpoint A/B reduced the incremental request wall from 11.39591s to 6.58736s. Reused tokens increased 603 to 1601. Extracted code matched and passed 36 cases; generated message lengths differed. This does not prove universal agent speedup. A later 9553-token prompt test is not full-context qualification. Do not add gains from different experiments.
 
-Weight caching does not train or improve model precision. Historical output hashes and MTP acceptance sometimes differed. Broad quality, memory-pressure, multi-model and multi-device regression coverage remains incomplete.
+Weight caching does not train or improve model precision. A manual coding run from the immutable K32 checkpoint was judged unusually strong by the user, but that is quality evidence for the checkpoint, not proof that caching trained or universally improved the model. Historical output hashes and MTP acceptance sometimes differed. Broad quality, memory-pressure, multi-model and multi-device regression coverage remains incomplete.
 
-## Known defects / excluded paths
+Bounded post-checkpoint experiments were retained as external evidence but not source code. b1024/ub1024 increased aggregate real-workload PP 14.54% but reduced TG 3.97%, changed the trajectory and reached 98.10% sampled VRAM use. A two-full-layer prefill placement gained 1.01% PP but lost 1.80% TG; a six-down-tensor ATSInfer-lite placement gained 1.48% PP but lost 10.17% TG through a changed MTP trajectory. Both worsened wall time and were removed completely. A layer-publication/dedicated-transfer prototype preserved output but lost about 1% TG; traces showed required scheduler/output synchronization drained the intended overlap. None of these percentages are added to the accepted checkpoint.
 
-**Do not use legacy full/down split modes as a supported release.** The initial snapshot retained four writes at `op_params + 4*sizeof(int32_t)` although op_params is int32_t[16]. A follow-up changes them to op_params[4]; the old offset overwrote tensor flags. The changed graph translation unit compiled, and a standalone test with the real ggml_tensor header plus ASan/UBSan checked marker/flags behavior at four capacities. This is not full legacy-mode inference validation. Candidate vulkan_host already used op_params[4] and its branch is unchanged. The full DEV server build was subsequently relinked successfully; corrected libllama SHA256 is `602639b82e4935baf48ac19a66776311f8927105f0cbfcefecdc97a87efdf4a7`.
+## Excluded paths and cleanup status
 
-Only explicit LLAMA_MOE_CACHE_MODE=vulkan_host is now accepted when requesting a positive expert-cache size. Missing/empty mode, full, down, vulkan_import, vulkan_exact and unknown names disable the cache with `only_vulkan_host_mode_supported`. LLAMA_MOE_CACHE_ALLOW_EXPERIMENTAL no longer bypasses this check. Ordinary cache-off inference (slots <= 0) is unchanged. Static hotsets within vulkan_host remain available; the adaptive candidate profile is unchanged. Rejected implementations remain archived in source, not selectable at runtime. They can be removed in a separately reviewed cleanup; do not mistake retained code for supported features.
+The initial snapshot contained legacy full/down/import/exact implementations, including invalid marker writes at `op_params + 4*sizeof(int32_t)`. Those runtime implementations and their unused interfaces were removed after their experiments were rejected. The supported vulkan_host path uses `op_params[4]`; its marker behavior was checked with the real ggml_tensor header under ASan/UBSan. Historical patches remain outside the fork for audit and recovery only.
+
+Only explicit LLAMA_MOE_CACHE_MODE=vulkan_host is accepted when requesting a positive expert-cache size. Missing/empty mode, full, down, vulkan_import, vulkan_exact and unknown names disable the cache with `only_vulkan_host_mode_supported`. LLAMA_MOE_CACHE_ALLOW_EXPERIMENTAL does not bypass this check. Ordinary cache-off inference (slots <= 0) is unchanged. Static hotsets within vulkan_host remain available; the adaptive candidate profile is unchanged. Rejected implementations have been removed from the runtime source; their names remain only in the negative mode-policy regression test and historical evidence outside the fork.
 
 The initial publication did not run a fresh benchmark. The marker follow-up was built, deployed and checked with one 128-token completion. Consolidation was built and tested with 14 rejected-mode/opt-in combinations, then the existing synthetic Vulkan adaptive tests: 12 updates and 3 reloads each for IQ2_S and IQ3_XXS with batch4. No new coding-task run or complete backend suite was needed for this initialization gate. Existing benchmark values remain historical, not newly claimed gains from consolidation.
 
 ## Provenance pins
 
-DEV patch SHA256: `a5f220f8623c90193d49654f8427b98571718880a4c37343647bcb90063f2b54`.
+The immutable source tag `checkpoint/rx590-k32-router-stable-20260907` identifies the cleaned K32 source checkpoint. The separately saved local runtime checkpoint contains its own SHA256 manifest and complete dynamic-library set; binaries, the GGUF model, profiles and private benchmark payloads are not distributed in this repository.
 
-Build files on disk at publication (not every historical benchmark):
-
-| File | SHA256 |
-| --- | --- |
-| llama-server | 4ee6495d28acd13ebfac8118a4cd63c90b513a87c453b7310baa42beb0c25854 |
-| libggml-vulkan.so.0.22.0 | 6b284f8c13c61c517d371c0213d82f4c3fc6c479e8b531ce9683b056efd56f88 |
-| libggml-base.so.0.22.0 | 45cd442cde32d69f2201fb43db18547cb32ac0bf6e173520a5093d9cdefa694b |
-| libllama.so.0.3.0 | 35a6bbd293ce52e10711f9c53c29d449574d6c3ed0b9eeda36a950e8a5b74e7a |
-
-The executable is dynamically linked: its hash alone does not identify backend behavior. GitHub Actions is disabled for this private snapshot; no inherited CI jobs should run automatically.
-
-After mode consolidation, DEV libllama SHA256 is `379eabe2b1b9b47f2c4214df2e118be2c83f63f5c3364c2232220c713b79098d`. The remote DEV worktree intentionally retains its base HEAD plus dirty changes; `--version` can report bccbacdb8 even when these changes are compiled. Identify a deployment by the publication commit, source comparison and library hashes together, not by --version alone.
+The server executable is dynamically linked, so its hash alone does not identify backend behavior. Identify a deployment by the immutable source tag plus the complete saved-runtime manifest, not by `--version`: the inherited version string can still report the upstream base commit. GitHub Actions is disabled for this private snapshot; no inherited CI jobs should run automatically.
 
 Focused checks supplied in this repository (Linux):
 
@@ -169,11 +168,11 @@ The mode test expects 14 `REJECT ... PASS` lines and 14 `only_vulkan_host_mode_s
 
 ## Rollback contract: prepare before changing anything
 
-Source checkpoint: tag `checkpoint/rx590-pp187-tg32-20260905` pins d7fb6792b3756217ad9e3970a67cb7943f9e4bc8. Never move or force-push a checkpoint tag. To recover source without deleting current work:
+Source checkpoint: immutable tag `checkpoint/rx590-k32-router-stable-20260907`. Never move or force-push a checkpoint tag. To recover source without deleting current work:
 
 ```sh
 git fetch origin --tags
-git worktree add --detach ../llama-tiel-checkpoint checkpoint/rx590-pp187-tg32-20260905
+git worktree add --detach ../llama-tiel-checkpoint checkpoint/rx590-k32-router-stable-20260907
 ```
 
 Build that worktree into a new directory, not an existing DEV/production build. A Git tag alone cannot restore a specific dynamically linked runtime. Before each implementation/build/profile change, use the local-only helper:
@@ -196,6 +195,6 @@ python /absolute/checkpoints/unique-name/checkpoint.py start /absolute/checkpoin
 
 Limits: GGUF model, driver, system libraries, OS, power settings and KV state are not included. A changed OS/driver may require additional recovery; the saved CMake cache is provenance, not portable build configuration. Hash verification proves saved-file identity, not inference quality. Keep the model unchanged and preserve benchmark evidence alongside the private checkpoint. Do not claim a restore succeeded until health and library paths are checked.
 
-Checkpoint verification performed: 29 saved files matched their manifest, ldd selected saved inference libraries, the saved executable ran --version, and `start` refused to proceed while DEV was running. Three no-GPU integrity tests cover corruption, missing files and an escaping manifest path. A full rollback/model load was deliberately not performed; the current DEV restarted successfully from its newly built library. Source tag and saved runtime remain available if that rollback becomes necessary.
+K32 checkpoint verification performed: 28 saved files matched their manifest, `ldd` selected the saved inference libraries, the saved executable ran `--version`, and the restored runtime reached healthy state on DEV port 8081. Five no-GPU integrity tests cover corruption, missing files, an escaping manifest path and the checkpoint/start safety contract. The immutable source tag and saved runtime are independent rollback anchors.
 
 For every future change: create/tag a checkpoint first; state scope and rollback target; change one mechanism; perform the smallest relevant regression check; publish only after reporting results; never silently advance the accepted checkpoint or repeat completed coding tasks without a reason.

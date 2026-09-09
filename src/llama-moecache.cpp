@@ -8,16 +8,13 @@
 
 #include <cinttypes>
 #include <algorithm>
-#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
-#include <deque>
 #include <fstream>
 #include <map>
 #include <sstream>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace {
@@ -34,43 +31,25 @@ struct layer_state {
     std::vector<int32_t>  slot_expert;   // slot -> expert id, -1 when empty
     std::vector<int32_t>  expert_slot;   // expert id -> slot, -1 when uncached
     std::vector<uint64_t> slot_last_use; // slot -> lamport clock of last hit
-    std::vector<int32_t>  pending;       // admitted uncached ids observed since last step
-    std::vector<uint16_t> miss_score;    // miss observations; admission proxy for expected reuse
     std::vector<float> recent_frequency;
 
-    std::vector<bool>     slot_in_flight;   // slot has an upload pending
-    std::vector<bool>     expert_in_flight; // expert already has an upload pending
 
-    uint64_t n_hit       = 0;
-    uint64_t n_miss      = 0;
-    uint64_t n_cpu_cold  = 0;
-    uint64_t n_admitted  = 0;
     uint64_t adaptive_hits = 0;
     uint64_t adaptive_misses = 0;
     uint64_t adaptive_uploads = 0;
     uint64_t adaptive_weight_bytes = 0;
 };
 
-struct upload_job {
-    size_t  layer_idx;
-    int32_t expert;
-    int32_t slot;
-    bool    done = false;
-};
-
 struct moe_cache {
+    ggml_context * extra_ctx = nullptr;
+    ggml_backend_buffer_t extra_buffer = nullptr;
     int32_t n_slots       = 0;
     int32_t max_inserts   = 2;
-    int32_t admit_after   = 1;
-    bool    down_only          = false;
     bool    vulkan_host_mode   = false;
-    bool    vulkan_import_mode = false;
-    bool    vulkan_exact_mode  = false;
 
     uint64_t clock   = 0;
     uint64_t n_steps = 0;
 
-    std::mutex mtx; // guards pending lists + clock (observe runs during graph exec)
 
     std::vector<layer_state> layers;
     std::map<const ggml_tensor *, size_t> by_up_src;
@@ -78,18 +57,7 @@ struct moe_cache {
     std::vector<ggml_context *>         ctxs;
     std::vector<ggml_backend_buffer_t>  bufs;
 
-    // async upload worker: slices are copied to the device off the decode
-    // thread; the new table mapping is only published at a later step() once
-    // the upload has completed, so a running graph never reads a torn slot
-    std::thread              worker;
-    std::mutex               wmtx;
-    std::condition_variable  wcv;
-    std::deque<upload_job>   todo;
-    std::vector<upload_job>  done;
-    bool                     stop = false;
-
-    // Static-hotset family bypasses the legacy observer/worker. Adaptive Vulkan
-    // uses this path too, but refreshes residency in update_vulkan().
+    // Adaptive residency is updated after graph execution.
     bool                     static_hotset = false;
     bool                     adaptive = false;
     bool                     frequency_admission = false;
@@ -105,79 +73,6 @@ moe_cache * g_cache = nullptr;
 std::mutex g_init_mtx;
 bool g_init_done = false;
 const llama_model * g_owner = nullptr;
-
-int parse_layer_from_name(const char * name) {
-    // "blk.<il>.ffn_gate_exps.weight"
-    if (strncmp(name, "blk.", 4) != 0) {
-        return -1;
-    }
-    return atoi(name + 4);
-}
-
-void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
-    moe_cache * mc = (moe_cache *) ud;
-
-    const int64_t n_ids    = ids->ne[0];
-    const int64_t n_tokens = ids->ne[1];
-    if (n_tokens > 4) {
-        return; // batch/prefill: the cache graph is not built there, don't pollute the LRU
-    }
-
-    const int il = parse_layer_from_name(name);
-    if (il < 0) {
-        return;
-    }
-
-    layer_state * ls = nullptr;
-    for (auto & l : mc->layers) {
-        if (l.pub.il == il) { ls = &l; break; }
-    }
-    if (!ls) {
-        return;
-    }
-
-    std::lock_guard<std::mutex> lock(mc->mtx);
-    for (int64_t t = 0; t < n_tokens; ++t) {
-        for (int64_t i = 0; i < n_ids; ++i) {
-            const int32_t id = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + i*ids->nb[0]);
-            if (id < 0 || id >= (int32_t) ls->expert_slot.size()) {
-                continue;
-            }
-            const int32_t slot = ls->expert_slot[id];
-            if (slot >= 0) {
-                ls->n_hit++;
-                ls->slot_last_use[slot] = ++mc->clock;
-            } else {
-                ls->n_miss++;
-
-                // FreeToken-lite admission: misses remain on CPU until reuse
-                // justifies paying PCIe + GPU residency cost.
-                if (ls->expert_in_flight[id]) {
-                    ls->n_cpu_cold++;
-                    continue;
-                }
-
-                uint16_t & score = ls->miss_score[id];
-                if (score != UINT16_MAX) {
-                    ++score;
-                }
-                if (score < mc->admit_after) {
-                    ls->n_cpu_cold++;
-                    continue;
-                }
-
-                bool dup = false;
-                for (int32_t p : ls->pending) {
-                    if (p == id) { dup = true; break; }
-                }
-                if (!dup) {
-                    ls->pending.push_back(id);
-                    ls->n_admitted++;
-                }
-            }
-        }
-    }
-}
 
 void upload_slice(ggml_tensor * dst_c, const ggml_tensor * src, int32_t expert, int32_t slot) {
     const size_t sz = src->nb[2];
@@ -210,110 +105,11 @@ bool verify_slice(const ggml_tensor * dst_c, const ggml_tensor * src, int32_t ex
 void set_table_entry(llama_moe_cache_layer & pub, int32_t expert, int32_t slot_or_dummy) {
     const bool force_miss = pub.vulkan_host && cache_env_enabled("LLAMA_MOE_CACHE_FORCE_MISS");
     const bool is_hot = !force_miss && slot_or_dummy < pub.n_slots;
-    const int32_t v = pub.vulkan_exact
-        ? (is_hot ? slot_or_dummy : pub.n_slots)
-        : (pub.vulkan_host
-            ? (int32_t) ((((uint32_t) expert) << 16) | (is_hot ? (uint32_t) slot_or_dummy : 0xffffu))
-            : slot_or_dummy);
+    const int32_t v = (int32_t) ((((uint32_t) expert) << 16) | (is_hot ? (uint32_t) slot_or_dummy : 0xffffu));
     for (int64_t lane = 0; lane < pub.dev_table->ne[2]; ++lane) {
         const size_t off = (size_t) lane*pub.dev_table->nb[2] + (size_t) expert*pub.dev_table->nb[1];
         ggml_backend_tensor_set(pub.dev_table, &v, off, sizeof(int32_t));
     }
-    if (pub.cold_table) {
-        const int32_t cold = is_hot ? pub.cold_dummy : expert;
-        for (int64_t lane = 0; lane < pub.cold_table->ne[2]; ++lane) {
-            const size_t off = (size_t) lane*pub.cold_table->nb[2] + (size_t) expert*pub.cold_table->nb[1];
-            ggml_backend_tensor_set(pub.cold_table, &cold, off, sizeof(int32_t));
-        }
-    }
-    ggml_backend_tensor_set(pub.host_table, &v, (size_t) expert*sizeof(int32_t), sizeof(int32_t));
-}
-
-void zero_expert_slice(ggml_tensor * tensor, int32_t expert) {
-    const size_t sz = tensor->nb[2];
-    std::vector<uint8_t> zero(sz, 0);
-    ggml_backend_tensor_set(tensor, zero.data(), (size_t) expert*sz, sz);
-}
-
-// Import an existing CPU tensor's storage into Vulkan without copying it. The returned
-// tensor is metadata-only and points into an external-memory VkBuffer wrapper. The CPU
-// tensor remains authoritative and keeps its original buffer, so prefill performance is
-// unchanged. Alignment is discovered conservatively by trying power-of-two import regions
-// fully contained in the original host buffer.
-bool import_cpu_tensor_alias(
-        ggml_context * ctx,
-        ggml_backend_dev_t vk_dev,
-        const ggml_tensor * src,
-        ggml_tensor ** out_alias,
-        ggml_backend_buffer_t * out_buf) {
-    if (!ctx || !vk_dev || !src || !src->buffer || !src->data || !out_alias || !out_buf) {
-        return false;
-    }
-    if (!ggml_backend_buffer_is_host(src->buffer)) {
-        return false;
-    }
-
-    auto * host_base = (uint8_t *) ggml_backend_buffer_get_base(src->buffer);
-    const size_t host_size = ggml_backend_buffer_get_size(src->buffer);
-    auto * src_ptr = (uint8_t *) src->data;
-    const size_t src_size = ggml_nbytes(src);
-    if (!host_base || src_ptr < host_base || src_ptr + src_size > host_base + host_size) {
-        return false;
-    }
-
-    const uintptr_t host_begin = (uintptr_t) host_base;
-    const uintptr_t host_end   = host_begin + host_size;
-    const uintptr_t data_begin = (uintptr_t) src_ptr;
-    const uintptr_t data_end   = data_begin + src_size;
-    static const size_t alignments[] = {
-        4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576
-    };
-
-    const bool import_debug = cache_env_enabled("LLAMA_MOE_CACHE_IMPORT_DEBUG");
-    if (import_debug) {
-        fprintf(stderr, "FREETOKEN_IMPORT_BEGIN name=%s buf=%s host=%p host_size=%zu data=%p bytes=%zu offset=%zu\n",
-                src->name, ggml_backend_buffer_name(src->buffer), host_base, host_size, src_ptr, src_size,
-                (size_t)(data_begin - host_begin));
-    }
-    for (size_t align : alignments) {
-        const uintptr_t import_begin = data_begin & ~(uintptr_t)(align - 1);
-        const uintptr_t import_end   = (data_end + align - 1) & ~(uintptr_t)(align - 1);
-        // The logical ggml CPU buffer may end part-way through the final mapped page.
-        // VK_EXT_external_memory_host requires an aligned import size; allowing the import
-        // to cover the remainder of that already-mapped tail page is safe because the
-        // tensor's descriptor/shape never reads beyond data_end.
-        const uintptr_t mapped_host_end = (host_end + align - 1) & ~(uintptr_t)(align - 1);
-        if (import_begin < host_begin || import_end > mapped_host_end || import_end <= import_begin) {
-            if (import_debug) fprintf(stderr, "FREETOKEN_IMPORT_SKIP align=%zu begin_ok=%d end_ok=%d\n",
-                    align, import_begin >= host_begin ? 1 : 0, import_end <= mapped_host_end ? 1 : 0);
-            continue;
-        }
-        const size_t import_size = (size_t)(import_end - import_begin);
-        ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(
-                vk_dev, (void *) import_begin, import_size, src_size);
-        if (import_debug) fprintf(stderr, "FREETOKEN_IMPORT_TRY align=%zu ptr=%p size=%zu ok=%d\n",
-                align, (void *) import_begin, import_size, buf ? 1 : 0);
-        if (!buf) {
-            continue;
-        }
-
-        ggml_tensor * alias = ggml_dup_tensor(ctx, src);
-        alias->buffer = buf;
-        alias->data = (uint8_t *) ggml_backend_buffer_get_base(buf) + (data_begin - import_begin);
-        alias->view_src = nullptr;
-        alias->view_offs = 0;
-        ggml_format_name(alias, "%s.ftvk", src->name);
-        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-        if (ggml_backend_buffer_init_tensor(buf, alias) != GGML_STATUS_SUCCESS) {
-            ggml_backend_buffer_free(buf);
-            continue;
-        }
-
-        *out_alias = alias;
-        *out_buf = buf;
-        return true;
-    }
-    return false;
 }
 
 bool file_exists(const std::string & path) {
@@ -391,7 +187,7 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
         const char * hotset_path = std::getenv("LLAMA_MOE_CACHE_HOTSET");
         const auto hotset = load_hotset(hotset_path);
         const bool static_requested = !hotset.empty();
-        mc->adaptive = mc->vulkan_host_mode && !mc->vulkan_import_mode && !mc->vulkan_exact_mode &&
+        mc->adaptive = mc->vulkan_host_mode &&
             cache_env_enabled("LLAMA_MOE_CACHE_ADAPTIVE");
         const char * admission = std::getenv("LLAMA_MOE_CACHE_ADMISSION");
         mc->frequency_admission = mc->adaptive && admission && std::strcmp(admission, "recent_frequency") == 0;
@@ -412,14 +208,6 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
             return;
         }
 
-        if (const char * env = std::getenv("LLAMA_MOE_CACHE_ADMIT_AFTER")) {
-            const long parsed = std::strtol(env, nullptr, 10);
-            if (parsed >= 1 && parsed <= 32) {
-                mc->admit_after = (int32_t) parsed;
-            } else {
-                LLAMA_LOG_WARN("LLAMA_MOE_CACHE_ADMIT_AFTER=%ld outside safe range [1,32]; using 1\n", parsed);
-            }
-        }
 
         // collect the host-resident expert layers, grouped by the device buffer
         // type of that layer's router (the cache lives next to the router)
@@ -451,11 +239,7 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
             }
             const char * expert_buft_name = ggml_backend_buft_name(ggml_backend_buffer_get_type(l.ffn_up_exps->buffer));
             if (mc->vulkan_host_mode) {
-                if (mc->vulkan_import_mode) {
-                    if (!ggml_backend_buffer_is_host(l.ffn_up_exps->buffer)) {
-                        continue; // import mode starts from the normal CPU expert placement
-                    }
-                } else if (std::strcmp(expert_buft_name, "Vulkan_Host") != 0) {
+                if (std::strcmp(expert_buft_name, "Vulkan_Host") != 0) {
                     continue; // legacy single-backend mode requires Vulkan_Host allocation
                 }
                 const auto hybrid_type_ok = [](ggml_type t) {
@@ -495,42 +279,7 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
             all.insert(all.end(), g.second.begin(), g.second.end());
         }
 
-        std::map<int, int32_t> layer_slots;
-        if (const char * plan = std::getenv("LLAMA_MOE_CACHE_LAYER_SLOTS")) {
-            bool valid = mc->adaptive && hotset.empty();
-            std::istringstream entries(plan);
-            std::string entry;
-            while (std::getline(entries, entry, ',')) {
-                std::istringstream item(entry);
-                int layer, slots;
-                char colon;
-                if (!(item >> layer >> colon >> slots) || colon != ':' || slots < 1 || slots >= 65535 ||
-                    !(item >> std::ws).eof() || !layer_slots.emplace(layer, slots).second) {
-                    valid = false;
-                    break;
-                }
-            }
-            uint64_t requested = 0, baseline = 0;
-            size_t matched = 0;
-            for (const auto & candidate : all) {
-                const auto it = layer_slots.find(candidate.il);
-                const int32_t slots = it == layer_slots.end() ? n_slots : it->second;
-                if (it != layer_slots.end()) ++matched;
-                valid = valid && slots <= candidate.l->ffn_up_exps->ne[2];
-                const uint64_t bytes = candidate.l->ffn_up_exps->nb[2] + candidate.l->ffn_gate_exps->nb[2] + candidate.l->ffn_down_exps->nb[2];
-                baseline += uint64_t(n_slots)*bytes;
-                requested += uint64_t(slots)*bytes;
-            }
-            valid = valid && !layer_slots.empty() && matched == layer_slots.size() && requested <= baseline;
-            if (!valid) {
-                fprintf(stderr, "FREETOKEN_LAYER_SLOTS rejected: require unique host layers, adaptive mode, no hotset, and original byte budget\n");
-                layer_slots.clear(); // Preserve the uniform cache on invalid experimental input.
-            } else {
-                fprintf(stderr, "FREETOKEN_LAYER_SLOTS accepted bytes=%" PRIu64 " budget=%" PRIu64 "\n", requested, baseline);
-            }
-        }
-
-        auto alloc_group = [&](ggml_backend_buffer_type_t buft, const std::vector<cand> & cands, bool tables_only) -> bool {
+        auto alloc_group = [&](ggml_backend_buffer_type_t buft, const std::vector<cand> & cands) -> bool {
             ggml_init_params ip = {
                 /*.mem_size  =*/ ggml_tensor_overhead()*(cands.size()*6 + 8),
                 /*.mem_buffer=*/ nullptr,
@@ -551,40 +300,26 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
                     mc->layers.push_back({});
                     ls = &mc->layers.back();
                     ls->pub.il       = c.il;
-                    ls->pub.n_slots   = layer_slots.count(c.il) ? layer_slots.at(c.il) : n_slots;
-                    ls->pub.down_only  = mc->down_only;
+                    ls->pub.n_slots   = n_slots;
                     ls->pub.vulkan_host = mc->vulkan_host_mode;
-                    ls->pub.vulkan_import = mc->vulkan_import_mode;
-                    ls->pub.vulkan_exact = mc->vulkan_exact_mode;
                     ls->pub.up_src   = c.l->ffn_up_exps;
                     ls->pub.gate_src = c.l->ffn_gate_exps;
                     ls->pub.down_src = c.l->ffn_down_exps;
                 }
 
-                if (tables_only) {
-                    ls->pub.host_table = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, ls->pub.up_src->ne[2]);
-                    ggml_format_name(ls->pub.host_table, "moe_cache_htbl.%d", c.il);
-                } else {
+                {
                     const ggml_tensor * u = c.l->ffn_up_exps;
                     const ggml_tensor * g = c.l->ffn_gate_exps;
                     const ggml_tensor * d = c.l->ffn_down_exps;
                     const int32_t cache_mats = ls->pub.n_slots + (mc->vulkan_host_mode ? 0 : 1);
-                    if (!mc->down_only) {
-                        ls->pub.up_c   = ggml_new_tensor_3d(ctx, u->type, u->ne[0], u->ne[1], cache_mats);
-                        ls->pub.gate_c = ggml_new_tensor_3d(ctx, g->type, g->ne[0], g->ne[1], cache_mats);
-                    }
+                    ls->pub.up_c   = ggml_new_tensor_3d(ctx, u->type, u->ne[0], u->ne[1], cache_mats);
+                    ls->pub.gate_c = ggml_new_tensor_3d(ctx, g->type, g->ne[0], g->ne[1], cache_mats);
                     ls->pub.down_c = ggml_new_tensor_3d(ctx, d->type, d->ne[0], d->ne[1], cache_mats);
                     ls->pub.dev_table = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 1, u->ne[2], 4);
-                    if (mc->vulkan_host_mode) {
-                        ls->pub.cold_table = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 1, u->ne[2], 4);
-                    }
-                    if (!mc->down_only) {
-                        ggml_format_name(ls->pub.up_c,   "moe_cache_up.%d",   c.il);
-                        ggml_format_name(ls->pub.gate_c, "moe_cache_gate.%d", c.il);
-                    }
+                    ggml_format_name(ls->pub.up_c,   "moe_cache_up.%d",   c.il);
+                    ggml_format_name(ls->pub.gate_c, "moe_cache_gate.%d", c.il);
                     ggml_format_name(ls->pub.down_c,    "moe_cache_down.%d", c.il);
                     ggml_format_name(ls->pub.dev_table, "moe_cache_tbl.%d",  c.il);
-                    if (ls->pub.cold_table) ggml_format_name(ls->pub.cold_table, "moe_cache_cold_tbl.%d", c.il);
                 }
             }
 
@@ -599,12 +334,12 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
             return true;
         };
 
-        bool ok = alloc_group(ggml_backend_cpu_buffer_type(), all, /*tables_only=*/true);
+        bool ok = true;
         for (auto & g : groups) {
             if (!ok) {
                 break;
             }
-            ok = alloc_group(g.first, g.second, /*tables_only=*/false);
+            ok = alloc_group(g.first, g.second);
         }
 
         if (!ok) {
@@ -616,49 +351,6 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
             return;
         }
 
-        if (mc->vulkan_import_mode) {
-            ggml_init_params ip = {
-                /*.mem_size  =*/ ggml_tensor_overhead()*(mc->layers.size()*3 + 8),
-                /*.mem_buffer=*/ nullptr,
-                /*.no_alloc  =*/ true,
-            };
-            ggml_context * import_ctx = ggml_init(ip);
-            if (!import_ctx) {
-                ok = false;
-            } else {
-                mc->ctxs.push_back(import_ctx);
-                for (auto & ls : mc->layers) {
-                    ggml_tensor * hot_ref = ls.pub.up_c ? ls.pub.up_c : ls.pub.down_c;
-                    ggml_backend_dev_t vk_dev = hot_ref && hot_ref->buffer
-                        ? ggml_backend_buft_get_device(ggml_backend_buffer_get_type(hot_ref->buffer))
-                        : nullptr;
-                    ggml_backend_buffer_t ub = nullptr, gb = nullptr, db = nullptr;
-                    if (!vk_dev ||
-                        !import_cpu_tensor_alias(import_ctx, vk_dev, ls.pub.up_src,   &ls.pub.up_vk,   &ub) ||
-                        !import_cpu_tensor_alias(import_ctx, vk_dev, ls.pub.gate_src, &ls.pub.gate_vk, &gb) ||
-                        !import_cpu_tensor_alias(import_ctx, vk_dev, ls.pub.down_src, &ls.pub.down_vk, &db)) {
-                        if (ub) ggml_backend_buffer_free(ub);
-                        if (gb) ggml_backend_buffer_free(gb);
-                        if (db) ggml_backend_buffer_free(db);
-                        ok = false;
-                        break;
-                    }
-                    mc->bufs.push_back(ub);
-                    mc->bufs.push_back(gb);
-                    mc->bufs.push_back(db);
-                }
-            }
-            if (!ok) {
-                LLAMA_LOG_WARN("%s: failed to import CPU MoE weights into Vulkan external host buffers - cache disabled\n", __func__);
-                for (auto * b : mc->bufs) { ggml_backend_buffer_free(b); }
-                for (auto * c : mc->ctxs) { ggml_free(c); }
-                delete mc;
-                g_init_done = true;
-                g_owner = &model;
-                return;
-            }
-        }
-
         // init LRU state + tables (everything uncached -> dummy slot n_slots)
         size_t vram = 0;
         for (auto & ls : mc->layers) {
@@ -667,15 +359,10 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
             ls.slot_expert.assign(local_slots, -1);
             ls.expert_slot.assign(n_expert, -1);
             ls.slot_last_use.assign(local_slots, 0);
-            ls.miss_score.assign(n_expert, 0);
             if (mc->frequency_admission) ls.recent_frequency.assign(n_expert, 0.0f);
-            ls.slot_in_flight.assign(local_slots, false);
-            ls.expert_in_flight.assign(n_expert, false);
-            ls.pub.cold_dummy = ls.pub.vulkan_exact ? (int32_t) n_expert : (int32_t) n_expert - 1;
 
-            std::vector<int32_t> dummy(n_expert, local_slots);
             std::vector<int32_t> dev_dummy((size_t) n_expert * ls.pub.dev_table->ne[2], local_slots);
-            if (ls.pub.vulkan_host && !ls.pub.vulkan_exact) {
+            if (ls.pub.vulkan_host) {
                 for (int64_t lane = 0; lane < ls.pub.dev_table->ne[2]; ++lane) {
                     for (int32_t ex = 0; ex < (int32_t) n_expert; ++ex) {
                         dev_dummy[(size_t) lane*n_expert + ex] =
@@ -684,16 +371,6 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
                 }
             }
             ggml_backend_tensor_set(ls.pub.dev_table, dev_dummy.data(), 0, dev_dummy.size()*sizeof(int32_t));
-            if (ls.pub.cold_table) {
-                std::vector<int32_t> cold((size_t) n_expert * ls.pub.cold_table->ne[2]);
-                for (int64_t lane = 0; lane < ls.pub.cold_table->ne[2]; ++lane) {
-                    for (int32_t ex = 0; ex < (int32_t) n_expert; ++ex) {
-                        cold[(size_t) lane*n_expert + ex] = ex;
-                    }
-                }
-                ggml_backend_tensor_set(ls.pub.cold_table, cold.data(), 0, cold.size()*sizeof(int32_t));
-            }
-            ggml_backend_tensor_set(ls.pub.host_table, dummy.data(), 0, n_expert*sizeof(int32_t));
 
             mc->by_up_src[ls.pub.up_src] = &ls - mc->layers.data();
             if (ls.pub.up_c)   vram += ggml_nbytes(ls.pub.up_c);
@@ -729,17 +406,13 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
                 for (int32_t id : wanted) {
                     if (slot >= ls.pub.n_slots) break;
                     if (id < 0 || id >= (int32_t) ls.expert_slot.size() || ls.expert_slot[id] >= 0) continue;
-                    if (!mc->down_only) {
-                        upload_slice(ls.pub.up_c,   ls.pub.up_src,   id, slot);
-                        upload_slice(ls.pub.gate_c, ls.pub.gate_src, id, slot);
-                    }
+                    upload_slice(ls.pub.up_c,   ls.pub.up_src,   id, slot);
+                    upload_slice(ls.pub.gate_c, ls.pub.gate_src, id, slot);
                     upload_slice(ls.pub.down_c, ls.pub.down_src, id, slot);
                     if (cache_env_enabled("LLAMA_MOE_CACHE_VERIFY")) {
                         bool same = verify_slice(ls.pub.down_c, ls.pub.down_src, id, slot);
-                        if (!mc->down_only) {
-                            same = same && verify_slice(ls.pub.up_c, ls.pub.up_src, id, slot);
-                            same = same && verify_slice(ls.pub.gate_c, ls.pub.gate_src, id, slot);
-                        }
+                        same = same && verify_slice(ls.pub.up_c, ls.pub.up_src, id, slot);
+                        same = same && verify_slice(ls.pub.gate_c, ls.pub.gate_src, id, slot);
                         if (!same) {
                             fprintf(stderr, "FREETOKEN_VERIFY_FAIL layer=%d expert=%d slot=%d\n", ls.pub.il, id, slot);
                             fail_init("hotset_verification");
@@ -755,33 +428,6 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
             }
             LLAMA_LOG_INFO("%s: FreeToken hotset: %zu experts preloaded, adaptive=%d, enabled=%d, control='%s'\n",
                     __func__, loaded, mc->adaptive ? 1 : 0, mc->enabled ? 1 : 0, mc->control_file.c_str());
-        } else {
-            mc->worker = std::thread([mc]() {
-                for (;;) {
-                    upload_job j;
-                    {
-                        std::unique_lock<std::mutex> lk(mc->wmtx);
-                        mc->wcv.wait(lk, [mc]() { return mc->stop || !mc->todo.empty(); });
-                        if (mc->stop) {
-                            return;
-                        }
-                        j = mc->todo.front();
-                        mc->todo.pop_front();
-                    }
-                    auto & ls = mc->layers[j.layer_idx];
-                    if (!mc->down_only) {
-                        upload_slice(ls.pub.up_c,   ls.pub.up_src,   j.expert, j.slot);
-                        upload_slice(ls.pub.gate_c, ls.pub.gate_src, j.expert, j.slot);
-                    }
-                    upload_slice(ls.pub.down_c, ls.pub.down_src, j.expert, j.slot);
-                    {
-                        std::lock_guard<std::mutex> lk(mc->wmtx);
-                        j.done = true;
-                        mc->done.push_back(j);
-                    }
-                }
-            });
-            ggml_set_moe_obs_callback(moe_obs_cb, mc);
         }
 
         if (mc->adaptive) {
@@ -836,9 +482,9 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
             fprintf(stderr, "FREETOKEN_ACTIVE layers=%zu loaded=%zu slots=%d enabled=%d\n", mc->layers.size(), loaded, mc->n_slots, mc->enabled ? 1 : 0);
         }
 
-        const char * mode_name = mc->vulkan_exact_mode ? "vulkan_exact" : (mc->vulkan_import_mode ? "vulkan_import" : (mc->vulkan_host_mode ? "vulkan_host" : (mc->down_only ? "down" : "full")));
-        LLAMA_LOG_INFO("%s: MoE expert cache enabled: %zu layers x %d slots, mode=%s, %d inserts/step, admit-after=%d, %.1f MiB device memory\n",
-                __func__, mc->layers.size(), n_slots, mode_name, mc->max_inserts, mc->admit_after, vram/1024.0/1024.0);
+        const char * mode_name = "vulkan_host";
+        LLAMA_LOG_INFO("%s: MoE expert cache enabled: %zu layers x %d slots, mode=%s, %d inserts/step, %.1f MiB device memory\n",
+                __func__, mc->layers.size(), n_slots, mode_name, mc->max_inserts, vram/1024.0/1024.0);
     }();
 }
 
@@ -850,13 +496,8 @@ void llama_moe_cache_free(const llama_model & model) {
     g_owner = nullptr;
     g_init_done = false;
     if (!mc) return;
-    if (!mc->static_hotset) ggml_set_moe_obs_callback(nullptr, nullptr);
-    {
-        std::lock_guard<std::mutex> worker_lock(mc->wmtx);
-        mc->stop = true;
-    }
-    mc->wcv.notify_all();
-    if (mc->worker.joinable()) mc->worker.join();
+    if (mc->extra_buffer) ggml_backend_buffer_free(mc->extra_buffer);
+    if (mc->extra_ctx) ggml_free(mc->extra_ctx);
     for (auto * buffer : mc->bufs) ggml_backend_buffer_free(buffer);
     for (auto * ctx : mc->ctxs) ggml_free(ctx);
     delete mc;
@@ -871,6 +512,75 @@ const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * up_exps
         return nullptr;
     }
     return &g_cache->layers[it->second].pub;
+}
+
+size_t llama_moe_cache_extra(const llama_model & model, int32_t slots, size_t budget) {
+    auto * mc = g_cache;
+    if (!mc || g_owner != &model || !mc->enabled || !mc->adaptive ||
+        !mc->vulkan_host_mode) return 0;
+    if (slots == 0) {
+        if (!mc->extra_buffer) return 0;
+        for (auto & ls : mc->layers) {
+            auto & p = ls.pub;
+            const int experts = ls.expert_slot.size();
+            for (auto & slot : ls.expert_slot) if (slot >= p.n_slots) slot = -1;
+            std::vector<int32_t> table(experts * 4);
+            for (int lane=0; lane<4; ++lane) for (int e=0; e<experts; ++e) {
+                table[lane*experts+e] = int32_t((uint32_t(e)<<16) | (ls.expert_slot[e]<0 ? 0xffffu : uint32_t(ls.expert_slot[e])));
+            }
+            ggml_backend_tensor_set(p.dev_table,table.data(),0,table.size()*sizeof(int32_t));
+            ls.slot_expert.resize(p.n_slots); ls.slot_last_use.resize(p.n_slots);
+            p.n_extra_slots=0; p.up_extra=p.gate_extra=p.down_extra=nullptr;
+        }
+        ggml_backend_buffer_free(mc->extra_buffer); mc->extra_buffer=nullptr;
+        ggml_free(mc->extra_ctx); mc->extra_ctx=nullptr;
+        fprintf(stderr,"FREETOKEN_EXTRA revoked=1 base_preserved=1\n");
+        return 0;
+    }
+    if (slots != 8 || mc->layers.empty() || mc->extra_buffer) return 0;
+    const auto buft = ggml_backend_buffer_get_type(mc->layers.front().pub.up_c->buffer);
+    const auto device = ggml_backend_buft_get_device(buft);
+    const auto reg = device ? ggml_backend_dev_backend_reg(device) : nullptr;
+    using banked_abi_fn = int (*)(ggml_backend_dev_t);
+    const auto banked_abi = reg ? reinterpret_cast<banked_abi_fn>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_tiel_banked_abi")) : nullptr;
+    if (!banked_abi || banked_abi(device) != 1) {
+        fprintf(stderr, "FREETOKEN_EXTRA disabled=1 reason=backend_abi_unavailable base_preserved=1\n");
+        return 0;
+    }
+    size_t required=0;
+    for (auto & ls : mc->layers) {
+        auto & p=ls.pub;
+        if (p.n_slots+slots > p.up_src->ne[2] || p.n_slots >= 0x8000 ||
+            ggml_backend_buffer_get_type(p.up_c->buffer)!=buft) return 0;
+        required += size_t(slots)*(p.up_src->nb[2]+p.gate_src->nb[2]+p.down_src->nb[2]);
+    }
+    if (required > budget) return 0;
+    // Reserve host metadata before allocating or publishing GPU storage.
+    for (auto & ls : mc->layers) {
+        ls.slot_expert.reserve(ls.pub.n_slots+slots);
+        ls.slot_last_use.reserve(ls.pub.n_slots+slots);
+    }
+    auto * ctx=ggml_init({ggml_tensor_overhead()*(mc->layers.size()*3+8),nullptr,true});
+    if (!ctx) return 0;
+    std::vector<ggml_tensor *> tensors;
+    for (auto & ls : mc->layers) for (auto * src : {ls.pub.up_src,ls.pub.gate_src,ls.pub.down_src}) {
+        tensors.push_back(ggml_new_tensor_3d(ctx,src->type,src->ne[0],src->ne[1],slots));
+    }
+    auto * buffer=ggml_backend_alloc_ctx_tensors_from_buft(ctx,buft);
+    if (!buffer) { ggml_free(ctx); fprintf(stderr,"FREETOKEN_EXTRA allocation_failed=1 base_preserved=1\n"); return 0; }
+    if (ggml_backend_buffer_get_size(buffer)>budget) {
+        ggml_backend_buffer_free(buffer);ggml_free(ctx);return 0;
+    }
+    mc->extra_ctx=ctx;mc->extra_buffer=buffer;
+    size_t i=0;
+    for (auto & ls : mc->layers) {
+        auto & p=ls.pub;
+        p.up_extra=tensors[i++];p.gate_extra=tensors[i++];p.down_extra=tensors[i++];p.n_extra_slots=slots;
+        ls.slot_expert.resize(p.n_slots+slots,-1);ls.slot_last_use.resize(p.n_slots+slots,0);
+    }
+    fprintf(stderr,"FREETOKEN_EXTRA active=1 layers=%zu slots=%d bytes=%zu\n",mc->layers.size(),slots,ggml_backend_buffer_get_size(buffer));
+    return ggml_backend_buffer_get_size(buffer);
 }
 
 void llama_moe_cache_update_vulkan(ggml_backend_sched * sched, int32_t n_tokens) {
@@ -928,7 +638,7 @@ void llama_moe_cache_update_vulkan(ggml_backend_sched * sched, int32_t n_tokens)
         for (size_t i = 0; i < n_insert; ++i) {
             const int32_t id = pending[i];
             int32_t slot = 0;
-            for (int32_t s = 0; s < pub.n_slots; ++s) {
+            for (int32_t s = 0; s < pub.n_slots + pub.n_extra_slots; ++s) {
                 if (ls.slot_expert[s] < 0) { slot = s; break; }
                 if (mc->frequency_admission) {
                     const float score = ls.recent_frequency[ls.slot_expert[s]];
@@ -939,11 +649,13 @@ void llama_moe_cache_update_vulkan(ggml_backend_sched * sched, int32_t n_tokens)
             const int32_t victim = ls.slot_expert[slot];
             if (mc->frequency_admission && victim >= 0 && ls.recent_frequency[id] <= ls.recent_frequency[victim]) break;
             if (victim >= 0) ls.expert_slot[victim] = -1;
-            for (auto tensors : {std::make_pair(pub.up_c, pub.up_src), std::make_pair(pub.gate_c, pub.gate_src),
-                                 std::make_pair(pub.down_c, pub.down_src)}) {
+            const bool extra = slot >= pub.n_slots;
+            const int32_t local_slot = extra ? slot-pub.n_slots : slot;
+            for (auto tensors : {std::make_pair(extra ? pub.up_extra : pub.up_c, pub.up_src), std::make_pair(extra ? pub.gate_extra : pub.gate_c, pub.gate_src),
+                                 std::make_pair(extra ? pub.down_extra : pub.down_c, pub.down_src)}) {
                 const auto * src = tensors.second;
                 ggml_backend_tensor_set_async(backend, tensors.first, (const uint8_t *) src->data + id * src->nb[2],
-                                              slot * tensors.first->nb[2], src->nb[2]);
+                                              local_slot * tensors.first->nb[2], src->nb[2]);
             }
             ls.expert_slot[id] = slot;
             ls.slot_expert[slot] = id;
@@ -958,10 +670,11 @@ void llama_moe_cache_update_vulkan(ggml_backend_sched * sched, int32_t n_tokens)
         if (table_changed) {
             auto * table = (int32_t *) (staging + table_offset);
             for (int32_t e = 0; e < n_expert; ++e) {
-                const uint32_t slot = ls.expert_slot[e] >= 0 ? ls.expert_slot[e] : 0xffffu;
+                const int32_t logical_slot = ls.expert_slot[e];
+                const uint32_t slot = logical_slot < 0 ? 0xffffu : logical_slot >= pub.n_slots ?
+                    (0x8000u | uint32_t(logical_slot-pub.n_slots)) : uint32_t(logical_slot);
                 table[e] = (int32_t) (((uint32_t) e << 16) | slot);
             }
-            memcpy(pub.host_table->data, table, n_expert * sizeof(int32_t));
             for (int lane = 1; lane < 4; ++lane) memcpy(table + lane * n_expert, table, n_expert * sizeof(int32_t));
             ggml_backend_tensor_set_async(backend, pub.dev_table, table, 0, ggml_nbytes(pub.dev_table));
         }
@@ -1005,80 +718,4 @@ void llama_moe_cache_step() {
         return;
     }
 
-    // 1) publish completed uploads (sync point: no graph is executing)
-    {
-        std::lock_guard<std::mutex> wlk(mc->wmtx);
-        std::lock_guard<std::mutex> lk(mc->mtx);
-        for (const auto & j : mc->done) {
-            auto & ls = mc->layers[j.layer_idx];
-            ls.slot_expert[j.slot]     = j.expert;
-            ls.expert_slot[j.expert]   = j.slot;
-            ls.slot_last_use[j.slot]      = ++mc->clock;
-            ls.slot_in_flight[j.slot]     = false;
-            ls.expert_in_flight[j.expert] = false;
-            set_table_entry(ls.pub, j.expert, j.slot);
-        }
-        mc->done.clear();
-    }
-
-    std::lock_guard<std::mutex> lock(mc->mtx);
-    mc->n_steps++;
-
-    // 2) schedule new uploads: evict at a sync point (clear the victim's table
-    //    entry now), then hand the slice copies to the worker
-    for (size_t li = 0; li < mc->layers.size(); ++li) {
-        auto & ls = mc->layers[li];
-        if (ls.pending.empty()) {
-            continue;
-        }
-
-        int budget = mc->max_inserts;
-        for (auto it = ls.pending.rbegin(); it != ls.pending.rend() && budget > 0; ++it, --budget) {
-            const int32_t id = *it;
-            if (ls.expert_slot[id] >= 0 || ls.expert_in_flight[id]) {
-                continue;
-            }
-
-            // victim: an empty non-in-flight slot if any, else the LRU non-in-flight slot
-            int32_t slot = -1;
-            uint64_t best = UINT64_MAX;
-            for (int32_t s = 0; s < ls.pub.n_slots; ++s) {
-                if (ls.slot_in_flight[s]) {
-                    continue;
-                }
-                if (ls.slot_expert[s] < 0) { slot = s; break; }
-                if (ls.slot_last_use[s] < best) { best = ls.slot_last_use[s]; slot = s; }
-            }
-            if (slot < 0) {
-                break; // every slot is in flight; try again next step
-            }
-
-            const int32_t victim = ls.slot_expert[slot];
-            if (victim >= 0) {
-                ls.expert_slot[victim] = -1;
-                ls.slot_expert[slot]   = -1;
-                set_table_entry(ls.pub, victim, ls.pub.n_slots);
-            }
-            ls.slot_in_flight[slot] = true;
-            ls.expert_in_flight[id]  = true;
-
-            std::lock_guard<std::mutex> wlk(mc->wmtx);
-            mc->todo.push_back({li, id, slot});
-        }
-        ls.pending.clear();
-    }
-    mc->wcv.notify_one();
-
-    if (mc->n_steps % 128 == 0) {
-        uint64_t h = 0, m = 0, cpu = 0, admitted = 0;
-        for (auto & ls : mc->layers) {
-            h += ls.n_hit;
-            m += ls.n_miss;
-            cpu += ls.n_cpu_cold;
-            admitted += ls.n_admitted;
-        }
-        LLAMA_LOG_INFO("moe-cache: steps=%" PRIu64 " hits=%" PRIu64 " misses=%" PRIu64
-                " hit-rate=%.1f%% cpu-miss=%" PRIu64 " admitted=%" PRIu64 "\n",
-                mc->n_steps, h, m, h + m ? 100.0*h/(h + m) : 0.0, cpu, admitted);
-    }
 }

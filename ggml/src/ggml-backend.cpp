@@ -920,21 +920,6 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
         tensor->src[3] != NULL &&
         tensor->src[3]->type == tensor->src[0]->type &&
         ggml_get_op_params_i32(tensor, 4) > 0;
-    const bool ft_exact =
-        ft_vkhost_src0 &&
-        tensor->src[4] != NULL &&
-        tensor->src[4]->type == tensor->src[0]->type;
-
-    if (ft_exact) {
-        // DEV FreeToken target: Vulkan0 is backend 0 on this single-GPU host.
-        // The hot-cache tensor is allocated from Vulkan0 and Vulkan_Host is
-        // explicitly supported by the same backend, so bypass scheduler
-        // heuristics that otherwise keep tiny MoE nodes on CPU.
-        GGML_ASSERT(sched->n_backends > 1);
-        GGML_ASSERT(ggml_backend_supports_buft(sched->backends[0], tensor->src[4]->buffer->buft));
-        SET_CAUSE(tensor, "1.ftex");
-        return 0;
-    }
 
     if (ft_hybrid) {
         const int hybrid_backend_id = ggml_backend_sched_backend_from_buffer(sched, tensor->src[3], tensor);
@@ -1647,11 +1632,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
-    static const int64_t vk_moe_full_copy_min = []() -> int64_t {
-        const char * value = getenv("GGML_VK_MOE_PREFILL_FULL_COPY_MIN");
-        return value ? std::max<int64_t>(0, atoll(value)) : 0;
-    }();
-
     int prev_backend_id = -1;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
@@ -1702,14 +1682,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
-
-                    // Dense prefill routing can use one copy without a route readback.
-                    if (vk_moe_full_copy_min > 0 && node->src[2]->ne[1] >= vk_moe_full_copy_min &&
-                        strcmp(ggml_backend_buft_name(input->buffer->buft), "Vulkan_Host") == 0 &&
-                        ggml_backend_buft_get_device(input->buffer->buft) == ggml_backend_get_device(split_backend)) {
-                        ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
-                        continue;
-                    }
 
                     ggml_backend_synchronize(input_backend);
 

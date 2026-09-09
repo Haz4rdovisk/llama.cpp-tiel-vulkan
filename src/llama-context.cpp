@@ -582,6 +582,82 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     }
 }
 
+bool llama_context::sched_prepare_phase(uint32_t n_tokens) {
+    if (!phase_arena_checked) {
+        phase_arena_checked = true;
+        const char * opt = getenv("LLAMA_TIEL_PHASE_ARENA");
+        bool vulkan = false;
+        for (auto * backend : backend_ptrs) {
+            vulkan |= std::strcmp(ggml_backend_name(backend), "Vulkan0") == 0;
+        }
+        phase_arena_enabled = opt && std::strcmp(opt, "1") == 0 && vulkan &&
+            cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && model.arch == LLM_ARCH_QWEN35MOE &&
+            !model.hparams.no_alloc && cparams.n_seq_max == 1 && !cparams.pipeline_parallel && cparams.n_ubatch > 4;
+        if (phase_arena_enabled) {
+            LLAMA_LOG_INFO("TIEL_PHASE enabled=1 target_only=1 decode_limit=4\n");
+        }
+    }
+    if (!phase_arena_enabled) {
+        return true;
+    }
+    const bool next_decode = n_tokens <= 4;
+    if (next_decode == phase_arena_decode) {
+        return true;
+    }
+    const int64_t start = ggml_time_us();
+    size_t before = 0;
+    for (auto * backend : backend_ptrs) {
+        if (std::strcmp(ggml_backend_name(backend), "Vulkan0") == 0) {
+            before += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+        }
+    }
+    phase_arena_decode = next_decode;
+    const char * extra_opt = getenv("LLAMA_TIEL_EXTRA_BANK");
+    const bool extra_enabled = extra_opt && std::strcmp(extra_opt, "1") == 0;
+    // Old graphs must not retain pointers to a bank being revoked.
+    synchronize();
+    gf_res_prev->reset();
+    gf_res_reserve->reset();
+    if (!next_decode) llama_moe_cache_extra(model, 0, 0);
+    sched_need_reserve = true;
+    try {
+        sched_reserve();
+    } catch (const std::exception & error) {
+        LLAMA_LOG_WARN("TIEL_PHASE fallback=1 reason=%s\n", error.what());
+        phase_arena_enabled = false;
+        phase_arena_decode = false;
+        sched_need_reserve = true;
+        try {
+            sched_reserve();
+        } catch (const std::exception & fallback) {
+            sched_need_reserve = true;
+            LLAMA_LOG_ERROR("TIEL_PHASE fallback_failed=1 reason=%s\n", fallback.what());
+            return false;
+        }
+    }
+    size_t after = 0;
+    for (auto * backend : backend_ptrs) {
+        if (std::strcmp(ggml_backend_name(backend), "Vulkan0") == 0) {
+            after += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+        }
+    }
+    if (phase_arena_decode && extra_enabled && before > after + 32*1024*1024) {
+        // Keep a margin; a failed expansion leaves the base cache usable.
+        try {
+            const size_t bytes=llama_moe_cache_extra(model, 8, before-after-32*1024*1024);
+            if (bytes) {
+                gf_res_prev->reset();gf_res_reserve->reset();
+                ggml_backend_sched_reset(sched.get());
+            }
+        } catch (const std::exception & error) {
+            LLAMA_LOG_WARN("FREETOKEN_EXTRA disabled=1 reason=%s\n",error.what());
+        }
+    }
+    LLAMA_LOG_INFO("TIEL_PHASE decode=%d before=%zu after=%zu transition_us=%" PRId64 "\n",
+        phase_arena_decode, before, after, ggml_time_us() - start);
+    return true;
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -596,9 +672,10 @@ void llama_context::sched_reserve() {
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_tokens_full = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_tokens = phase_arena_decode ? std::min(n_tokens_full, 4u) : n_tokens_full;
 
-    const size_t max_nodes = this->graph_max_nodes(n_tokens);
+    const size_t max_nodes = this->graph_max_nodes(n_tokens_full);
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
@@ -1731,6 +1808,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
     embd_seq.clear();
 
+    // Finish the previous batch before accounting tokens for the next one.
+    if (!sched_prepare_phase(n_tokens_all)) {
+        return -2;
+    }
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
     }

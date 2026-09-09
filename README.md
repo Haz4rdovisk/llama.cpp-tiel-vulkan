@@ -1,6 +1,6 @@
 # llama.cpp
 
-> Experimental Tiel/RX590 branch, not a production release. See [TIEL-EXPERIMENTAL.md](TIEL-EXPERIMENTAL.md) for the supported candidate profile, measured limitations and known legacy-path bugs. This is an independent research snapshot, not an official FreeToken or ATSInfer implementation.
+> Experimental Tiel/RX590 branch, not a production release. See [TIEL-EXPERIMENTAL.md](TIEL-EXPERIMENTAL.md) for the supported K32 profile, measured limitations, rollback contract and paper-mechanism map. Rejected runtime paths were removed. This is an independent adaptation, not an official FreeToken or ATSInfer implementation.
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
