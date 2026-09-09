@@ -1,9 +1,17 @@
 #include "types.glsl"
 
+#ifdef MUL_MAT_ID_BANKED
+// This variant reserves binding 3 for extra weights and has no fused ops.
+#define MAT_VEC_FUSION_FLAGS_BIAS0 0
+#define MAT_VEC_FUSION_FLAGS_BIAS1 0
+#define MAT_VEC_FUSION_FLAGS_SCALE0 0
+#define MAT_VEC_FUSION_FLAGS_SCALE1 0
+#else
 #define MAT_VEC_FUSION_FLAGS_BIAS0 0x1
 #define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+#endif
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
 #if defined(A_TYPEV4)
@@ -29,6 +37,13 @@ layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 layout (binding = 3) readonly buffer Fuse0 {D_TYPE data_fuse0[];};
 layout (binding = 4) readonly buffer Fuse1 {D_TYPE data_fuse1[];};
 
+#ifdef MUL_MAT_ID_BANKED
+layout (binding = 3) readonly buffer EXTRA_A {A_TYPE extra_data_a[];};
+#if defined(A_TYPE_PACKED16)
+layout (binding = 3) readonly buffer EXTRA_A_PACKED16 {A_TYPE_PACKED16 extra_data_a_packed16[];};
+#endif
+#endif
+
 #ifdef MUL_MAT_ID
 layout (binding = 5) readonly buffer IDS {int data_ids[];};
 #endif
@@ -39,4 +54,3 @@ layout (binding = 6) readonly buffer HOT_A {A_TYPE hot_data_a[];};
 layout (binding = 6) readonly buffer HOT_A_PACKED16 {A_TYPE_PACKED16 hot_data_a_packed16[];};
 #endif
 #endif
-

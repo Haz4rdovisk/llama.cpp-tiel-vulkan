@@ -10,12 +10,13 @@ Base commit: `bccbacdb8945680f1cfc7e6bffd1e59014705750`, the expert-cache branch
 - Packed expert/slot IDs; IQ2_S gate/up and IQ3_XXS down kernels.
 - Per-layer adaptive cache, small target/MTP batches up to four, publication at graph boundaries.
 - K24 base residency plus an eight-slot per-layer decode bank (K32 effective), allocated only after the prefill arena is released and revoked before prefill returns.
+- Source-generated, tested banked Vulkan SPIR-V and a seven-binding dispatch that selects cold host, base VRAM or extra-bank VRAM weights without a CPU/GPU merge.
 - Normal non-hybrid scheduling for prefill; optional tool-message checkpoints for incremental prompts.
 - Hardware scope: RX590 8GB, i7-7700, one model/slot. Not a complete implementation of every FreeToken/ATSInfer technique.
 
 ## Mechanisms and source map
 
-### Decode: one dispatch, two weight locations
+### Decode: one dispatch, three weight locations
 
 For each eligible MoE projection, src[0] remains the authoritative cold expert tensor in Vulkan_Host memory and src[3] references quantized hot weights in VRAM. The table lookup produces a packed I32 route: high 16 bits are the original expert ID; low 16 bits are the cache slot, or 0xffff on a miss. The Vulkan shader selects the weight source within the same dispatch. No separate expert-to-slot descriptor binding or CPU/GPU output merge is required.
 
@@ -29,7 +30,7 @@ Gate/up use IQ2_S, down uses IQ3_XXS for this model. The cache copies quantized 
 
 The candidate has 26 host layers x 24 base slots = 624 complete gate/up/down expert entries, about 638.625 MiB of quantized weight cache, excluding tables and scratch buffers. During decode, the phase arena can fund another eight slots per layer (about 212.875 MiB), producing K32 effective capacity without keeping the extra bank alive during prefill. Capacity changes only at the synchronized PP/TG boundary; LRU residency changes at runtime. Optional recent-frequency admission exists, but the measured default remains per-layer LRU. This is not an online bandwidth-aware placement solver.
 
-The base/extra split is a shader ABI. `ggml_backend_tiel_banked_abi` is published through the Vulkan backend registry and checked before allocating the extra bank. A mismatched rebuilt Vulkan library therefore disables K32 rather than silently interpreting packed extra-slot IDs with the wrong shader.
+The base/extra split is a shader ABI. `ggml_backend_tiel_banked_abi` is published through the Vulkan backend registry and checked before allocating the extra bank. A mismatched rebuilt Vulkan library therefore disables K32 rather than silently interpreting packed extra-slot IDs with the wrong shader. All six banked IQ2_S/IQ3_XXS variants are generated from tracked GLSL by the normal Vulkan shader generator; no opaque prebuilt SPIR-V header is required. A fresh build produced byte-identical SPIR-V to the approved K32 runtime artifacts and passed `spirv-val`.
 
 `llama_moe_cache_init/free` track ownership and clean up failed initialization; model destruction releases the owning cache. Captured routes avoid the profiler's per-node host synchronization. The candidate remains scoped to one model/slot; ownership checks do not establish unrestricted multi-model concurrency.
 
@@ -152,7 +153,9 @@ The initial publication did not run a fresh benchmark. The marker follow-up was 
 
 ## Provenance pins
 
-The immutable source tag `checkpoint/rx590-k32-router-stable-20260907` identifies the cleaned K32 source checkpoint. The separately saved local runtime checkpoint contains its own SHA256 manifest and complete dynamic-library set; binaries, the GGUF model, profiles and private benchmark payloads are not distributed in this repository.
+The immutable source tag `checkpoint/rx590-k32-source-complete-20260908` identifies the cleaned, rebuildable K32 source checkpoint. The separately saved local runtime checkpoint contains its own SHA256 manifest and complete dynamic-library set; binaries, the GGUF model, profiles and private benchmark payloads are not distributed in this repository.
+
+The earlier immutable tag `checkpoint/rx590-k32-router-stable-20260907` is retained for audit but is not a complete source rollback: it omitted the banked Vulkan source/header while the saved runtime already contained that backend. Do not deploy or rebuild K32 from that tag. It was not moved or force-updated; this follow-up restores the exact approved backend source and has its own replacement tag.
 
 The server executable is dynamically linked, so its hash alone does not identify backend behavior. Identify a deployment by the immutable source tag plus the complete saved-runtime manifest, not by `--version`: the inherited version string can still report the upstream base commit. GitHub Actions is disabled for this private snapshot; no inherited CI jobs should run automatically.
 
@@ -168,11 +171,11 @@ The mode test expects 14 `REJECT ... PASS` lines and 14 `only_vulkan_host_mode_s
 
 ## Rollback contract: prepare before changing anything
 
-Source checkpoint: immutable tag `checkpoint/rx590-k32-router-stable-20260907`. Never move or force-push a checkpoint tag. To recover source without deleting current work:
+Source checkpoint: immutable tag `checkpoint/rx590-k32-source-complete-20260908`. Never move or force-push a checkpoint tag. To recover source without deleting current work:
 
 ```sh
 git fetch origin --tags
-git worktree add --detach ../llama-tiel-checkpoint checkpoint/rx590-k32-router-stable-20260907
+git worktree add --detach ../llama-tiel-checkpoint checkpoint/rx590-k32-source-complete-20260908
 ```
 
 Build that worktree into a new directory, not an existing DEV/production build. A Git tag alone cannot restore a specific dynamically linked runtime. Before each implementation/build/profile change, use the local-only helper:
@@ -195,6 +198,6 @@ python /absolute/checkpoints/unique-name/checkpoint.py start /absolute/checkpoin
 
 Limits: GGUF model, driver, system libraries, OS, power settings and KV state are not included. A changed OS/driver may require additional recovery; the saved CMake cache is provenance, not portable build configuration. Hash verification proves saved-file identity, not inference quality. Keep the model unchanged and preserve benchmark evidence alongside the private checkpoint. Do not claim a restore succeeded until health and library paths are checked.
 
-K32 checkpoint verification performed: 28 saved files matched their manifest, `ldd` selected the saved inference libraries, the saved executable ran `--version`, and the restored runtime reached healthy state on DEV port 8081. Five no-GPU integrity tests cover corruption, missing files, an escaping manifest path and the checkpoint/start safety contract. The immutable source tag and saved runtime are independent rollback anchors.
+K32 checkpoint verification performed: 28 saved files matched their manifest, `ldd` selected the saved inference libraries, the saved executable ran `--version`, and the restored runtime reached healthy state on DEV port 8081. Five no-GPU integrity tests cover corruption, missing files, an escaping manifest path and the checkpoint/start safety contract. A fresh isolated source build passed the K32 host-buffer contract for IQ2_S and IQ3_XXS: 96 adaptive updates, extra-bank accesses, byte-exact resident weights/maps, output equality, revocation and three reloads. The replacement immutable source tag and saved runtime are independent rollback anchors.
 
 For every future change: create/tag a checkpoint first; state scope and rollback target; change one mechanism; perform the smallest relevant regression check; publish only after reporting results; never silently advance the accepted checkpoint or repeat completed coding tasks without a reason.

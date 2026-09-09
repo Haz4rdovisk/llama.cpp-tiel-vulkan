@@ -933,6 +933,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_iq2_s_hybrid[DMMV_WG_SIZE_COUNT];
+    vk_pipeline pipeline_tiel_banked[2][DMMV_WG_SIZE_COUNT];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_iq3_xxs_hybrid[DMMV_WG_SIZE_COUNT];
 
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
@@ -5423,6 +5424,37 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             mul_mat_vec_id_iq2_s_f32_f32_hybrid_subgroup_data,
             mul_mat_vec_id_iq2_s_f32_f32_hybrid_subgroup_no_shmem_data,
         };
+        const void * banked_data[2][SHADER_REDUCTION_MODE_COUNT] = {
+            {
+                mul_mat_vec_id_iq2_s_f32_f32_hybrid_banked_data,
+                mul_mat_vec_id_iq2_s_f32_f32_hybrid_banked_subgroup_data,
+                mul_mat_vec_id_iq2_s_f32_f32_hybrid_banked_subgroup_no_shmem_data,
+            },
+            {
+                mul_mat_vec_id_iq3_xxs_f32_f32_hybrid_banked_data,
+                mul_mat_vec_id_iq3_xxs_f32_f32_hybrid_banked_subgroup_data,
+                mul_mat_vec_id_iq3_xxs_f32_f32_hybrid_banked_subgroup_no_shmem_data,
+            },
+        };
+        const uint64_t banked_len[2][SHADER_REDUCTION_MODE_COUNT] = {
+            {
+                mul_mat_vec_id_iq2_s_f32_f32_hybrid_banked_len,
+                mul_mat_vec_id_iq2_s_f32_f32_hybrid_banked_subgroup_len,
+                mul_mat_vec_id_iq2_s_f32_f32_hybrid_banked_subgroup_no_shmem_len,
+            },
+            {
+                mul_mat_vec_id_iq3_xxs_f32_f32_hybrid_banked_len,
+                mul_mat_vec_id_iq3_xxs_f32_f32_hybrid_banked_subgroup_len,
+                mul_mat_vec_id_iq3_xxs_f32_f32_hybrid_banked_subgroup_no_shmem_len,
+            },
+        };
+        for (int quant = 0; quant < 2; ++quant) {
+            ggml_vk_create_pipeline(device, device->pipeline_tiel_banked[quant][w],
+                quant == 0 ? "tiel_banked_iq2_s" : "tiel_banked_iq3_xxs",
+                banked_len[quant][reduc16], banked_data[quant][reduc16],
+                "main", 7, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1},
+                {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
+        }
         const uint64_t hybrid_iq2_s_len[SHADER_REDUCTION_MODE_COUNT] = {
             mul_mat_vec_id_iq2_s_f32_f32_hybrid_len,
             mul_mat_vec_id_iq2_s_f32_f32_hybrid_subgroup_len,
@@ -8048,11 +8080,15 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_pipeline(ggml_backend_vk_co
     }
 }
 
-static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id_hybrid(ggml_backend_vk_context * ctx, ggml_type a_type, uint32_t m, uint32_t k) {
+static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id_hybrid(ggml_backend_vk_context * ctx, ggml_type a_type, uint32_t m, uint32_t k, bool banked = false) {
     uint32_t dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
     if ((ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) ||
         ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
         if (m <= 8192 && k >= 1024) dmmv_wg = DMMV_WG_SIZE_LARGE;
+    }
+    if (banked) {
+        GGML_ASSERT(a_type == GGML_TYPE_IQ2_S || a_type == GGML_TYPE_IQ3_XXS);
+        return ctx->device->pipeline_tiel_banked[a_type == GGML_TYPE_IQ2_S ? 0 : 1][dmmv_wg];
     }
     if (a_type == GGML_TYPE_IQ2_S) return ctx->device->pipeline_dequant_mul_mat_vec_id_iq2_s_hybrid[dmmv_wg];
     if (a_type == GGML_TYPE_IQ3_XXS) return ctx->device->pipeline_dequant_mul_mat_vec_id_iq3_xxs_hybrid[dmmv_wg];
@@ -10568,6 +10604,20 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     ggml_tensor * src1 = dst->src[1];
     ggml_tensor * ids = dst->src[2];
     ggml_tensor * hot_src = dst->src[3];
+    const int32_t extra_slots = ggml_get_op_params_i32(dst, 5);
+    const bool banked_moe = extra_slots > 0;
+    if (banked_moe) {
+        const auto * extra = dst->src[4];
+        GGML_ASSERT(ctx->num_additional_fused_ops == 0);
+        GGML_ASSERT(extra && hot_src && extra->type == src0->type && hot_src->type == src0->type);
+        GGML_ASSERT(src0->type == GGML_TYPE_IQ2_S || src0->type == GGML_TYPE_IQ3_XXS);
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 && src1->ne[2] <= 4);
+        GGML_ASSERT(ggml_is_contiguous(extra) && ggml_is_contiguous(hot_src));
+        GGML_ASSERT(extra->ne[0] == src0->ne[0] && extra->ne[1] == src0->ne[1] && extra->ne[2] == extra_slots);
+        GGML_ASSERT(hot_src->ne[0] == src0->ne[0] && hot_src->ne[1] == src0->ne[1]);
+        GGML_ASSERT(extra_slots < 0x7fff && hot_src->ne[2] < 0x8000);
+        GGML_ASSERT(ggml_get_op_params_i32(dst, 4) == hot_src->ne[2] + 1);
+    }
     const bool hybrid_moe = hot_src != nullptr && hot_src->type == src0->type &&
         (src0->type == GGML_TYPE_IQ2_S || src0->type == GGML_TYPE_IQ3_XXS) && src1->type == GGML_TYPE_F32;
     VK_LOG_DEBUG("ggml_vk_mul_mat_vec_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
@@ -10621,7 +10671,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     vk_pipeline dmmv = nullptr;
     if (hybrid_moe) {
         quantize_y = false;
-        dmmv = ggml_vk_get_dequantize_mul_mat_vec_id_hybrid(ctx, src0->type, ne20, ne00);
+        dmmv = ggml_vk_get_dequantize_mul_mat_vec_id_hybrid(ctx, src0->type, ne20, ne00, banked_moe);
     } else {
         dmmv = quantize_y ? ggml_vk_get_dequantize_mul_mat_vec_id(ctx, src0->type, GGML_TYPE_Q8_1, ne20, ne00) : nullptr;
     }
@@ -10797,9 +10847,14 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
             (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
             (uint32_t)(ne00 * ne01), stride_batch_y, (uint32_t)(ne20 * ne21),
             fusion_flags,
-            (uint32_t)nei0, (uint32_t)ne11, batch_hybrid ? UINT32_MAX : expert_i1, nbi1, skip_expert_id
+            (uint32_t)nei0, (uint32_t)ne11, batch_hybrid ? UINT32_MAX : expert_i1, nbi1,
+            banked_moe ? (skip_expert_id | (uint32_t(extra_slots) << 16)) : skip_expert_id
         };
         if (hybrid_moe) {
+            if (banked_moe) {
+                GGML_ASSERT(fusion_flags == 0);
+                d_F0 = ggml_vk_tensor_subbuffer(ctx, dst->src[4]);
+            }
             ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
                 { d_X, d_Y, d_D, d_F0, d_F1, d_ids, d_hot },
                 pc, { groups_x, (uint32_t)(nei0 * (batch_hybrid ? nei1 : 1)), groups_z });
@@ -16882,6 +16937,9 @@ static bool ggml_vk_is_empty(ggml_tensor * node) {
 }
 
 static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
+    if (cgraph->nodes[node_idx]->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(cgraph->nodes[node_idx], 5) > 0) {
+        return false;
+    }
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
@@ -19249,10 +19307,6 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
-// The split base/extra cache layout changes the packed-slot ABI consumed by
-// the Vulkan MUL_MAT_ID shaders.  Advertise support through the backend
-// registry so llama code never enables the extra bank against a mismatched
-// Vulkan library.
 static int ggml_backend_tiel_banked_abi(ggml_backend_dev_t device) {
     return device && device->iface.supports_op == ggml_backend_vk_device_supports_op ? 1 : 0;
 }

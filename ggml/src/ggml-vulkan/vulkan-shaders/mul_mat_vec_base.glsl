@@ -45,6 +45,9 @@ layout (push_constant) uniform parameter
 uint expert_id;
 #ifdef MUL_MAT_ID_HYBRID
 bool use_hot_expert;
+#ifdef MUL_MAT_ID_BANKED
+bool use_extra_expert;
+#endif
 uint weight_expert_id;
 #endif
 #endif
@@ -88,8 +91,18 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 #ifdef MUL_MAT_ID_HYBRID
     expert_id = routed_id >> 16;
     const uint mapped_slot = routed_id & 0xffffu;
+#ifdef MUL_MAT_ID_BANKED
+    // Low/high halves of skip_expert_id hold base/extra capacities.
+    const uint base_capacity = p.skip_expert_id & 0xffffu;
+    const uint extra_capacity = p.skip_expert_id >> 16;
+    const uint extra_slot = mapped_slot & 0x7fffu;
+    use_extra_expert = mapped_slot != 0xffffu && (mapped_slot & 0x8000u) != 0 && extra_slot < extra_capacity;
+    use_hot_expert = mapped_slot < base_capacity;
+    weight_expert_id = use_extra_expert ? extra_slot : (use_hot_expert ? mapped_slot : expert_id);
+#else
     use_hot_expert = mapped_slot < p.skip_expert_id;
     weight_expert_id = use_hot_expert ? mapped_slot : expert_id;
+#endif
 #else
     expert_id = routed_id;
 #endif

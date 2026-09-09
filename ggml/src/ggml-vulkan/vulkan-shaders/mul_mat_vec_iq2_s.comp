@@ -8,6 +8,9 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
 
 float load_iq2s_d(const uint idx) {
+#ifdef MUL_MAT_ID_BANKED
+    if (use_extra_expert) return float(extra_data_a[idx].d);
+#endif
 #ifdef MUL_MAT_ID_HYBRID
     return use_hot_expert ? float(hot_data_a[idx].d) : float(data_a[idx].d);
 #else
@@ -15,6 +18,9 @@ float load_iq2s_d(const uint idx) {
 #endif
 }
 uint load_iq2s_scales(const uint idx, const uint q) {
+#ifdef MUL_MAT_ID_BANKED
+    if (use_extra_expert) return extra_data_a[idx].scales[q];
+#endif
 #ifdef MUL_MAT_ID_HYBRID
     return use_hot_expert ? hot_data_a[idx].scales[q] : data_a[idx].scales[q];
 #else
@@ -22,6 +28,9 @@ uint load_iq2s_scales(const uint idx, const uint q) {
 #endif
 }
 uint load_iq2s_qh(const uint idx, const uint q) {
+#ifdef MUL_MAT_ID_BANKED
+    if (use_extra_expert) return extra_data_a[idx].qh[q];
+#endif
 #ifdef MUL_MAT_ID_HYBRID
     return use_hot_expert ? hot_data_a[idx].qh[q] : data_a[idx].qh[q];
 #else
@@ -29,6 +38,9 @@ uint load_iq2s_qh(const uint idx, const uint q) {
 #endif
 }
 uint load_iq2s_qs16(const uint idx, const uint q) {
+#ifdef MUL_MAT_ID_BANKED
+    if (use_extra_expert) return extra_data_a_packed16[idx].qs[q];
+#endif
 #ifdef MUL_MAT_ID_HYBRID
     return use_hot_expert ? hot_data_a_packed16[idx].qs[q] : data_a_packed16[idx].qs[q];
 #else
