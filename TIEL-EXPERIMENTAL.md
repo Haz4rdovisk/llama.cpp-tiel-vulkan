@@ -1,10 +1,10 @@
 # Tiel Vulkan experimental snapshot
 
-This private development snapshot preserves the cleaned K40 RX590 checkpoint. It is not a production release or an upstream submission. Code was developed with AI assistance under user direction. Original authorship, history and licenses remain intact.
+This private development snapshot preserves the promoted long-prefill-residency/K40 RX590 checkpoint. It is not a production release or an upstream submission. Code was developed with AI assistance under user direction. Original authorship, history and licenses remain intact.
 
 Base commit: `bccbacdb8945680f1cfc7e6bffd1e59014705750`, the expert-cache branch by csantiago78, on top of llama.cpp. This branch contains the cleaned single-dispatch adaptation, phase-safe K24/K40 capacity, router-stability fix and checkpoint tooling. Production was not changed.
 
-## Candidate architecture
+## Promoted DEV architecture
 
 - Single Vulkan MUL_MAT_ID dispatch with cold host weights and hot VRAM weights; no second CPU/GPU chain in the candidate path.
 - Packed expert/slot IDs; IQ2_S gate/up and IQ3_XXS down kernels.
@@ -160,6 +160,8 @@ With adaptive cache active on both sides, one USER-only versus TOOL-checkpoint A
 
 The long-prefill residency gate used the same 100,128-character llama.cpp code prompt, 27,473 prompt tokens, greedy seed and 24-token output. OFF took 318.377s of prompt evaluation (86.29 PP) and 319.539s wall. ON took 179.719s/180.781s on its first cycle and 184.495s/185.451s on its second cycle with prompt caching disabled, a 42-43% wall reduction. Both ON cycles and OFF produced SHA256 `30b392a378883b255cd6171e009e1be77063ebc48cd282b8c5d0dfdd8e469ae1` and MTP 9/13. A smaller 5,417-token A/B improved PP by 0.71% and wall by 0.82%, showing why activation is restricted to long prefills. The 24-token decode samples are too short to claim a TG change; they only verify that profiled K40 was restored and output remained exact.
 
+Before promotion, the saved runtime also completed real Pi auto-compaction traffic. A fresh 16,420-token prompt with zero prompt-cache reuse reached 162.55 PP, then restored profiled K40 and decoded 793 tokens at 29.50 TG with MTP acceptance 341/452 (75.44%). A subsequent fresh 30,734-token compacted prompt reached 142.51 PP before restoring the same 416-slot profiled extra bank; early decode was about 27.5 TG. The larger prompt is not an exact A/B, but its PP is 69% above the historical 31,882-token result at 84.22 PP. These live runs confirm phase transitions under the target workflow; they do not replace the controlled A/B above.
+
 Weight caching does not train or improve model precision. A manual coding run from the immutable K32 checkpoint was judged unusually strong by the user, but that is quality evidence for the checkpoint, not proof that caching trained or universally improved the model. Historical output hashes and MTP acceptance sometimes differed. Broad quality, memory-pressure, multi-model and multi-device regression coverage remains incomplete.
 
 Bounded post-checkpoint experiments were retained as external evidence but not source code. b1024/ub1024 increased aggregate real-workload PP 14.54% but reduced TG 3.97%, changed the trajectory and reached 98.10% sampled VRAM use. An earlier static two-full-layer placement gained 1.01% PP but lost 1.80% TG because it remained active during decode; a six-down-tensor ATSInfer-lite placement gained 1.48% PP but lost 10.17% TG through a changed MTP trajectory. Both were removed completely. The later phase-resident candidate differs by borrowing the decode cache only after three prefill ubatches and restoring exact profiled K40 before generation. A layer-publication/dedicated-transfer prototype preserved output but lost about 1% TG; traces showed required scheduler/output synchronization drained the intended overlap. Rejected percentages are not added to the accepted checkpoint.
@@ -184,6 +186,8 @@ The accepted successor tag `checkpoint/rx590-k40-prefill-aware-20260909` adds on
 
 The profiled successor tag `checkpoint/rx590-k40-profiled-slots-20260909` adds the validated per-layer plan interface. Its private runtime checkpoint verifies commit `e79184ecf` and 27 saved files. Uniform K40 remains its immediate rollback.
 
+The promoted successor tag `checkpoint/rx590-long-prefill-residency-20260910` adds phase-resident complete layers for long prefill while restoring the exact profiled K40 decode path at the PP/TG boundary. Its private runtime checkpoint is `/home/lucas/.local/state/tiel-agentic-dev/checkpoints/prefill-residency-v1-20260910`; 27 manifest files and source commit `220e29ccb` were verified before promotion. Profiled K40 remains the immediate rollback and was not moved or overwritten.
+
 The earlier immutable tag `checkpoint/rx590-k32-router-stable-20260907` is retained for audit but is not a complete source rollback: it omitted the banked Vulkan source/header while the saved runtime already contained that backend. Do not deploy or rebuild K32 from that tag. It was not moved or force-updated; this follow-up restores the exact approved backend source and has its own replacement tag.
 
 The server executable is dynamically linked, so its hash alone does not identify backend behavior. Identify a deployment by the immutable source tag plus the complete saved-runtime manifest, not by `--version`: the inherited version string can still report the upstream base commit. GitHub Actions is disabled for this private snapshot; no inherited CI jobs should run automatically.
@@ -200,11 +204,11 @@ The mode test expects 14 `REJECT ... PASS` lines and 14 `only_vulkan_host_mode_s
 
 ## Rollback contract: prepare before changing anything
 
-Accepted source checkpoint: immutable tag `checkpoint/rx590-k40-profiled-slots-20260909`. Uniform `checkpoint/rx590-k40-prefill-aware-20260909` remains the immediate rollback, followed by K32. Never move or force-push a checkpoint tag. To recover profiled K40 source without deleting current work:
+Accepted source checkpoint: immutable tag `checkpoint/rx590-long-prefill-residency-20260910`. Profiled `checkpoint/rx590-k40-profiled-slots-20260909` remains the immediate rollback, followed by uniform K40 and K32. Never move or force-push a checkpoint tag. To recover the accepted source without deleting current work:
 
 ```sh
 git fetch origin --tags
-git worktree add --detach ../llama-tiel-checkpoint checkpoint/rx590-k40-profiled-slots-20260909
+git worktree add --detach ../llama-tiel-checkpoint checkpoint/rx590-long-prefill-residency-20260910
 ```
 
 Build that worktree into a new directory, not an existing DEV/production build. A Git tag alone cannot restore a specific dynamically linked runtime. Before each implementation/build/profile change, use the local-only helper:
