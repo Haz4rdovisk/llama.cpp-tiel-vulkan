@@ -1988,6 +1988,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
+    // A long prefill may borrow the idle decode-cache allocation for a small
+    // set of complete expert tensors. The aliases are device-local and keep
+    // normal IDs/matmul semantics; small-batch hybrid decode is unchanged.
+    if (n_tokens > llama_moe_cache_max_tokens()) {
+        up_exps   = llama_moe_cache_prefill_weight(up_exps);
+        gate_exps = llama_moe_cache_prefill_weight(gate_exps);
+        down_exps = llama_moe_cache_prefill_weight(down_exps);
+    }
+
     ggml_tensor * logits = nullptr;
 
     if (probs_in == nullptr) {

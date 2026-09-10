@@ -17,6 +17,8 @@
 struct llama_model;
 struct ggml_tensor;
 struct ggml_backend_sched;
+struct ggml_backend;
+typedef struct ggml_backend * ggml_backend_t;
 
 struct llama_moe_cache_layer {
     int il = -1;
@@ -52,6 +54,16 @@ void llama_moe_cache_free(const llama_model & model);
 
 // nullptr when the cache is disabled or this tensor has no cached layer
 const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * up_exps);
+
+// During a long prefill, temporarily reuse the otherwise idle base-cache
+// allocation for complete resident expert tensors. The caller must quiesce
+// the backend and discard all graphs before either transition. Disabling
+// restores every resident decode slice and mapping before returning.
+bool llama_moe_cache_prefill_residency(const llama_model & model, ggml_backend_t backend, bool enable);
+
+// Return a temporary full-resident alias while prefill residency is active.
+// Otherwise return source unchanged.
+ggml_tensor * llama_moe_cache_prefill_weight(ggml_tensor * source);
 
 // Refresh the optional control-file switch between graph executions.
 void llama_moe_cache_step();

@@ -12,7 +12,8 @@ Base commit: `bccbacdb8945680f1cfc7e6bffd1e59014705750`, the expert-cache branch
 - K24 base residency plus a prefill-aware 16-slot per-layer decode bank (K40 effective), allocated only when scheduler/device budgets preserve a 128 MiB VRAM reserve and revoked before prefill returns.
 - Optional profiled redistribution keeps exactly 416 transient slots but varies them by layer through `LLAMA_MOE_CACHE_EXTRA_PLAN`; an invalid plan preserves K24 rather than allocating an ambiguous bank.
 - Source-generated, tested banked Vulkan SPIR-V and a seven-binding dispatch that selects cold host, base VRAM or extra-bank VRAM weights without a CPU/GPU merge.
-- Normal non-hybrid scheduling for prefill; optional tool-message checkpoints for incremental prompts.
+- Long prefills may reuse the idle K24 base allocation for two complete device-local expert layers after three full ubatches; all decode slices and tables are restored before K40 decode. Short prefills keep normal scheduling.
+- Optional tool-message checkpoints reuse unchanged agent prefixes.
 - Hardware scope: RX590 8GB, i7-7700, one model/slot. Not a complete implementation of every FreeToken/ATSInfer technique.
 
 ## Mechanisms and source map
@@ -37,9 +38,13 @@ The profiled successor uses total per-layer capacities `32,30,31,35,49,35,43,36,
 
 `llama_moe_cache_init/free` track ownership and clean up failed initialization; model destruction releases the owning cache. Captured routes avoid the profiler's per-node host synchronization. The candidate remains scoped to one model/slot; ownership checks do not establish unrestricted multi-model concurrency.
 
-### Prefill: preserve the working scheduler
+### Prefill: phase-resident complete layers
 
-Large batches bypass the hybrid cache branch and use normal model weights and scheduler handling. llama.cpp deliberately uses GPU host buffers for some CPU-side weights, so Vulkan_Host does not mean an operation must run on CPU. An early global CPU-forcing rule caused the PP collapse; removing that rule and narrowly recognizing hybrid access recovered PP.
+Large batches bypass the hybrid decode branch. llama.cpp deliberately uses GPU host buffers for some CPU-side weights, so Vulkan_Host does not mean an operation must run on CPU. An early global CPU-forcing rule caused the PP collapse; removing that rule and narrowly recognizing hybrid access recovered PP.
+
+With `LLAMA_TIEL_PREFILL_RESIDENCY=1`, the third consecutive full prefill ubatch may repurpose the otherwise idle monolithic K24 base-cache allocation. Complete gate/up/down tensors are copied once for as many whole host layers as fit; the current 669,753,344-byte allocation holds two layers (549,453,824 bytes). The graph substitutes only those device-local aliases and leaves all other weights and normal MoE IDs unchanged. Before decode, every occupied K24 expert slice and all four mapping lanes are rebuilt from authoritative Vulkan_Host weights, then the profiled K40 bank is allocated normally. Activation, restoration or graph-reservation failure falls back without changing the immutable checkpoint.
+
+This is persistent residency across ubatches, not the paper's transfer/computation double buffer: uploads are synchronized once at phase entry, and no transfer queue overlaps an active graph. The three-ubatch threshold avoids paying the transition cost for short prompts.
 
 `ggml/src/ggml-backend.cpp` anchors only recognized hybrid nodes to the hot-cache backend and permits their cold source without a staging copy. Generic Vulkan_Host support is not globally forced on. `ggml_vk_tensor_subbuffer` resolves pinned host buffers; graph overlap bookkeeping uses the actual subbuffer instead of casting incompatible buffer contexts. A later host-view fix removed a duplicated view offset.
 
@@ -59,7 +64,7 @@ Primary references, checked against the papers rather than Reddit commentary:
 | --- | --- |
 | FreeToken shared LRU expert cache | Adapted to fixed per-layer slots and a Vulkan hybrid dispatch; no global pool. |
 | FreeToken q-star split of misses between CPU execution and GPU cache fills | Not integrated; cold misses are read by the Vulkan kernel. |
-| FreeToken prefill transfer/computation double buffering | Not integrated; normal prefill scheduling retained. |
+| FreeToken prefill transfer/computation double buffering | Narrow alternative for this hardware: two complete expert layers persist in the borrowed K24 allocation across long-prefill ubatches. There is no transfer/compute overlap or streaming double buffer. |
 | FreeToken semantic-boundary recurrent-state reuse | Narrow adaptation: TOOL boundaries in existing llama.cpp checkpoints, not the complete paper policy. |
 | FreeToken elastic cache resizing and loading layout | Partial, bounded adaptation: a synchronized K24-to-K40 per-layer bank follows the prefill/decode phase and reliable Vulkan memory budget, preserves 128 MiB, and falls back to K24. No continuous resizing, global pool or FTW layout. |
 | ATSInfer profiled tensor placement with memory and switching costs | Narrow offline adaptation: measured routes drive a fixed host26 extra-slot plan under the same memory budget. No online solver or tensor switching policy. |
@@ -80,6 +85,7 @@ Hardware-driven exclusions from our own experiments: the dual CPU/GPU FFN chains
 | Current consolidation | Removed rejected cache modes, prefill-copy and per-layer slot-plan runtime code; retained explicit negative policy tests. Added phase-banked capacity, checkpoint isolation and the Vulkan banked-ABI capability check. |
 | K40 promotion | Expanded only the transient bank to 16 slots/layer, gated it on real prefill, added reliable Vulkan-budget handling and retained a 128 MiB reserve. Two controlled 512-token runs preserved K32 output/MTP while improving decode and wall time. |
 | Profiled K40 redistribution | Dynamic programming over current routes redistributed the same 416 transient slots. Replay removed 445 misses (0.83%); clean TG was 35.54 with exact K40 output/MTP and no extra VRAM. |
+| Long-prefill residency candidate | Reuse the idle K24 allocation for two full layers after three ubatches, then reconstruct K24 and allocate profiled K40 before decode. A 27,473-token code prompt improved PP from 86.29 to 152.87/148.91 with identical output and MTP. |
 
 The completed coding task and prior quality checks are accepted evidence; this consolidation does not request repeating them. They do not imply every possible task or context length is correct. The short 128-token completion is a separate regression check, not a completed coding task.
 
@@ -144,14 +150,19 @@ Historical short measurements (not repeated during publication):
 | Host26/K40 proof, 512 generated | 188.28 | 35.57 |
 | Host26/K40 promotion validation, 512 generated | 189.91 | 35.18 |
 | Host26/profiled-K40 validation, 512 generated | 188.25 | 35.54 |
+| Profiled K40, prefill residency OFF, 27,473 prompt | 86.29 | 22.82 |
+| Profiled K40, prefill residency ON, first cycle, 27,473 prompt | 152.87 | 22.68 |
+| Profiled K40, prefill residency ON, second cycle, 27,473 prompt | 148.91 | 25.36 |
 
 The first two rows used different configurations and are not a statistical estimate of speedup. The paired K24/K32 rows used the same corrected runtime: K32 improved TG 2.78% and wall 1.92%, with identical output SHA256 and MTP 240/271. The K40 rows used the same K32 prompt, seed and greedy output contract; both retained SHA256 `360c18cfe36f0a75ab97d2eeeb2a45a13c1a59617d45a00d9b17bf14dd496266`, 1,922 characters and MTP 240/271. K40 wall was 19.971 s and 20.082 s versus 20.391 s for K32. These bounded runs are not confidence intervals. An earlier hybrid achieved TG28.99 but PP51.68 and worse wall time; it is not the candidate prefill architecture.
 
 With adaptive cache active on both sides, one USER-only versus TOOL-checkpoint A/B reduced the incremental request wall from 11.39591s to 6.58736s. Reused tokens increased 603 to 1601. Extracted code matched and passed 36 cases; generated message lengths differed. This does not prove universal agent speedup. A later 9553-token prompt test is not full-context qualification. Do not add gains from different experiments.
 
+The long-prefill residency gate used the same 100,128-character llama.cpp code prompt, 27,473 prompt tokens, greedy seed and 24-token output. OFF took 318.377s of prompt evaluation (86.29 PP) and 319.539s wall. ON took 179.719s/180.781s on its first cycle and 184.495s/185.451s on its second cycle with prompt caching disabled, a 42-43% wall reduction. Both ON cycles and OFF produced SHA256 `30b392a378883b255cd6171e009e1be77063ebc48cd282b8c5d0dfdd8e469ae1` and MTP 9/13. A smaller 5,417-token A/B improved PP by 0.71% and wall by 0.82%, showing why activation is restricted to long prefills. The 24-token decode samples are too short to claim a TG change; they only verify that profiled K40 was restored and output remained exact.
+
 Weight caching does not train or improve model precision. A manual coding run from the immutable K32 checkpoint was judged unusually strong by the user, but that is quality evidence for the checkpoint, not proof that caching trained or universally improved the model. Historical output hashes and MTP acceptance sometimes differed. Broad quality, memory-pressure, multi-model and multi-device regression coverage remains incomplete.
 
-Bounded post-checkpoint experiments were retained as external evidence but not source code. b1024/ub1024 increased aggregate real-workload PP 14.54% but reduced TG 3.97%, changed the trajectory and reached 98.10% sampled VRAM use. A two-full-layer prefill placement gained 1.01% PP but lost 1.80% TG; a six-down-tensor ATSInfer-lite placement gained 1.48% PP but lost 10.17% TG through a changed MTP trajectory. Both worsened wall time and were removed completely. A layer-publication/dedicated-transfer prototype preserved output but lost about 1% TG; traces showed required scheduler/output synchronization drained the intended overlap. None of these percentages are added to the accepted checkpoint.
+Bounded post-checkpoint experiments were retained as external evidence but not source code. b1024/ub1024 increased aggregate real-workload PP 14.54% but reduced TG 3.97%, changed the trajectory and reached 98.10% sampled VRAM use. An earlier static two-full-layer placement gained 1.01% PP but lost 1.80% TG because it remained active during decode; a six-down-tensor ATSInfer-lite placement gained 1.48% PP but lost 10.17% TG through a changed MTP trajectory. Both were removed completely. The later phase-resident candidate differs by borrowing the decode cache only after three prefill ubatches and restoring exact profiled K40 before generation. A layer-publication/dedicated-transfer prototype preserved output but lost about 1% TG; traces showed required scheduler/output synchronization drained the intended overlap. Rejected percentages are not added to the accepted checkpoint.
 
 ## Excluded paths and cleanup status
 

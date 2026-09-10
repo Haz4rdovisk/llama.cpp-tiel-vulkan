@@ -68,6 +68,12 @@ struct layer_state {
     uint64_t adaptive_weight_bytes = 0;
 };
 
+struct prefill_alias_entry {
+    const ggml_tensor * source = nullptr;
+    ggml_tensor * resident = nullptr;
+    int32_t il = -1;
+};
+
 struct moe_cache {
     ggml_context * extra_ctx = nullptr;
     ggml_backend_buffer_t extra_buffer = nullptr;
@@ -95,6 +101,12 @@ struct moe_cache {
     ggml_backend_buffer_t    transfer_buffer = nullptr;
     bool                     enabled = true;
     std::string              control_file;
+
+    // Optional long-prefill phase. Complete tensors temporarily alias the
+    // base cache allocation; decode residency is rebuilt before leaving it.
+    std::vector<prefill_alias_entry> prefill_aliases;
+    bool                     prefill_resident = false;
+    size_t                   prefill_resident_bytes = 0;
 };
 
 moe_cache * g_cache = nullptr;
@@ -542,6 +554,163 @@ const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * up_exps
     return &g_cache->layers[it->second].pub;
 }
 
+ggml_tensor * llama_moe_cache_prefill_weight(ggml_tensor * source) {
+    auto * mc = g_cache;
+    if (!mc || !mc->prefill_resident || !source) {
+        return source;
+    }
+    for (const auto & entry : mc->prefill_aliases) {
+        if (entry.source == source) {
+            return entry.resident;
+        }
+    }
+    return source;
+}
+
+bool llama_moe_cache_prefill_residency(const llama_model & model, ggml_backend_t backend, bool enable) {
+    auto * mc = g_cache;
+    if (!mc || g_owner != &model || !backend || !mc->enabled || !mc->adaptive ||
+        !mc->vulkan_host_mode || mc->layers.empty()) {
+        return false;
+    }
+
+    if (!enable) {
+        if (!mc->prefill_resident) {
+            return true;
+        }
+
+        const int64_t start_us = ggml_time_us();
+        uint64_t restored_bytes = 0;
+        auto * table_staging = (uint8_t *) ggml_backend_buffer_get_base(mc->transfer_buffer);
+        size_t table_offset = ggml_nbytes(mc->route_ids);
+
+        // The extra bank is revoked before entering this phase. Restore the
+        // complete base residency from authoritative pinned host weights.
+        for (auto & ls : mc->layers) {
+            auto & pub = ls.pub;
+            GGML_ASSERT(pub.n_extra_slots == 0);
+            GGML_ASSERT((int32_t) ls.slot_expert.size() == pub.n_slots);
+            for (int32_t slot = 0; slot < pub.n_slots; ++slot) {
+                const int32_t expert = ls.slot_expert[slot];
+                if (expert < 0) {
+                    continue;
+                }
+                for (auto tensors : {
+                        std::make_pair(pub.up_c,   pub.up_src),
+                        std::make_pair(pub.gate_c, pub.gate_src),
+                        std::make_pair(pub.down_c, pub.down_src)}) {
+                    const auto * src = tensors.second;
+                    ggml_backend_tensor_set_async(backend, tensors.first,
+                            (const uint8_t *) src->data + (size_t) expert * src->nb[2],
+                            (size_t) slot * tensors.first->nb[2], src->nb[2]);
+                    restored_bytes += src->nb[2];
+                }
+            }
+
+            const int32_t n_expert = (int32_t) ls.expert_slot.size();
+            auto * table = (int32_t *) (table_staging + table_offset);
+            for (int lane = 0; lane < 4; ++lane) {
+                for (int32_t expert = 0; expert < n_expert; ++expert) {
+                    const int32_t slot = ls.expert_slot[expert];
+                    const uint32_t packed_slot = slot < 0 ? 0xffffu : (uint32_t) slot;
+                    table[lane * n_expert + expert] =
+                        (int32_t) (((uint32_t) expert << 16) | packed_slot);
+                }
+            }
+            ggml_backend_tensor_set_async(backend, pub.dev_table, table, 0, ggml_nbytes(pub.dev_table));
+            table_offset += ggml_nbytes(pub.dev_table);
+        }
+        ggml_backend_synchronize(backend);
+        mc->prefill_resident = false;
+        fprintf(stderr, "TIEL_PREFILL_RESIDENT active=0 restored_bytes=%" PRIu64 " transition_us=%" PRId64 "\n",
+                restored_bytes, ggml_time_us() - start_us);
+        return true;
+    }
+
+    if (mc->prefill_resident) {
+        return true;
+    }
+    if (mc->extra_buffer || !mc->transfer_buffer) {
+        fprintf(stderr, "TIEL_PREFILL_RESIDENT rejected=1 reason=cache_not_quiescent\n");
+        return false;
+    }
+
+    if (mc->prefill_aliases.empty()) {
+        ggml_backend_buffer_t base_buffer = mc->layers.front().pub.up_c->buffer;
+        if (!base_buffer || !ggml_backend_buffer_get_base(base_buffer)) {
+            fprintf(stderr, "TIEL_PREFILL_RESIDENT rejected=1 reason=no_addressable_base\n");
+            return false;
+        }
+        for (const auto & ls : mc->layers) {
+            for (const auto * tensor : {ls.pub.up_c, ls.pub.gate_c, ls.pub.down_c, ls.pub.dev_table}) {
+                if (!tensor || tensor->buffer != base_buffer) {
+                    fprintf(stderr, "TIEL_PREFILL_RESIDENT rejected=1 reason=non_monolithic_base\n");
+                    return false;
+                }
+            }
+        }
+
+        ggml_context * alias_ctx = ggml_init({
+                ggml_tensor_overhead() * (mc->layers.size() * 3 + 8), nullptr, true});
+        if (!alias_ctx) {
+            return false;
+        }
+        const size_t capacity = ggml_backend_buffer_get_size(base_buffer);
+        const size_t alignment = ggml_backend_buft_get_alignment(ggml_backend_buffer_get_type(base_buffer));
+        auto align_up = [alignment](size_t value) {
+            return ((value + alignment - 1) / alignment) * alignment;
+        };
+        auto * base = (uint8_t *) ggml_backend_buffer_get_base(base_buffer);
+        size_t offset = 0;
+        size_t selected_layers = 0;
+        std::vector<prefill_alias_entry> aliases;
+
+        for (const auto & ls : mc->layers) {
+            const ggml_tensor * sources[] = {ls.pub.up_src, ls.pub.gate_src, ls.pub.down_src};
+            size_t end = offset;
+            for (const auto * source : sources) {
+                end = align_up(end);
+                end += ggml_backend_buffer_get_alloc_size(base_buffer, source);
+            }
+            if (end > capacity) {
+                continue;
+            }
+            for (const auto * source : sources) {
+                offset = align_up(offset);
+                auto * resident = ggml_dup_tensor(alias_ctx, source);
+                ggml_format_name(resident, "prefill_resident.%d.%s", ls.pub.il, source->name);
+                if (ggml_backend_tensor_alloc(base_buffer, resident, base + offset) != GGML_STATUS_SUCCESS) {
+                    ggml_free(alias_ctx);
+                    return false;
+                }
+                aliases.push_back({source, resident, ls.pub.il});
+                offset += ggml_backend_buffer_get_alloc_size(base_buffer, resident);
+            }
+            ++selected_layers;
+        }
+        if (selected_layers == 0) {
+            ggml_free(alias_ctx);
+            fprintf(stderr, "TIEL_PREFILL_RESIDENT rejected=1 reason=no_complete_layer_fits\n");
+            return false;
+        }
+        mc->ctxs.push_back(alias_ctx);
+        mc->prefill_aliases = std::move(aliases);
+        mc->prefill_resident_bytes = offset;
+        fprintf(stderr, "TIEL_PREFILL_RESIDENT prepared=1 layers=%zu bytes=%zu capacity=%zu\n",
+                selected_layers, offset, capacity);
+    }
+
+    const int64_t load_start_us = ggml_time_us();
+    for (const auto & entry : mc->prefill_aliases) {
+        GGML_ASSERT(entry.source->data != nullptr);
+        ggml_backend_tensor_set_async(backend, entry.resident, entry.source->data, 0, ggml_nbytes(entry.source));
+    }
+    ggml_backend_synchronize(backend);
+    mc->prefill_resident = true;
+    fprintf(stderr, "TIEL_PREFILL_RESIDENT active=1 tensors=%zu bytes=%zu transition_us=%" PRId64 "\n",
+            mc->prefill_aliases.size(), mc->prefill_resident_bytes, ggml_time_us() - load_start_us);
+    return true;
+}
 size_t llama_moe_cache_extra(const llama_model & model, int32_t slots, size_t budget) {
     auto * mc = g_cache;
     if (!mc || g_owner != &model || !mc->enabled || !mc->adaptive ||

@@ -601,10 +601,27 @@ bool llama_context::sched_prepare_phase(uint32_t n_tokens) {
         return true;
     }
     const bool next_decode = n_tokens <= 4;
+    const bool phase_changed = next_decode != phase_arena_decode;
+    const char * residency_opt = getenv("LLAMA_TIEL_PREFILL_RESIDENCY");
+    const bool residency_enabled = residency_opt && std::strcmp(residency_opt, "1") == 0;
+    const bool full_prefill_batch = !next_decode && n_tokens >= cparams.n_ubatch;
+    bool activate_prefill_residency = false;
+
     if (!next_decode) {
         phase_arena_prefill_seen = true;
     }
-    if (next_decode == phase_arena_decode) {
+    if (phase_changed && !next_decode) {
+        phase_prefill_full_batches = full_prefill_batch ? 1 : 0;
+        phase_prefill_attempted = false;
+    } else if (!phase_changed && !next_decode && full_prefill_batch && !phase_prefill_resident) {
+        ++phase_prefill_full_batches;
+    }
+    if (residency_enabled && !next_decode && !phase_prefill_resident && !phase_prefill_attempted &&
+        phase_prefill_full_batches >= 3) {
+        activate_prefill_residency = true;
+        phase_prefill_attempted = true;
+    }
+    if (!phase_changed && !activate_prefill_residency) {
         return true;
     }
     const int64_t start = ggml_time_us();
@@ -622,11 +639,43 @@ bool llama_context::sched_prepare_phase(uint32_t n_tokens) {
     gf_res_prev->reset();
     gf_res_reserve->reset();
     if (!next_decode) llama_moe_cache_extra(model, 0, 0);
+
+    ggml_backend_t vulkan_backend = nullptr;
+    for (auto * backend : backend_ptrs) {
+        if (std::strcmp(ggml_backend_name(backend), "Vulkan0") == 0) {
+            vulkan_backend = backend;
+            break;
+        }
+    }
+    if (next_decode && phase_prefill_resident) {
+        if (!llama_moe_cache_prefill_residency(model, vulkan_backend, false)) {
+            LLAMA_LOG_ERROR("TIEL_PREFILL_RESIDENT restore_failed=1\n");
+            return false;
+        }
+        phase_prefill_resident = false;
+        phase_prefill_full_batches = 0;
+        phase_prefill_attempted = false;
+    } else if (activate_prefill_residency) {
+        phase_prefill_resident = llama_moe_cache_prefill_residency(model, vulkan_backend, true);
+        if (!phase_prefill_resident) {
+            LLAMA_LOG_WARN("TIEL_PREFILL_RESIDENT fallback=1\n");
+        }
+    }
     sched_need_reserve = true;
     try {
         sched_reserve();
     } catch (const std::exception & error) {
         LLAMA_LOG_WARN("TIEL_PHASE fallback=1 reason=%s\n", error.what());
+        if (phase_prefill_resident) {
+            synchronize();
+            gf_res_prev->reset();
+            gf_res_reserve->reset();
+            if (!llama_moe_cache_prefill_residency(model, vulkan_backend, false)) {
+                LLAMA_LOG_ERROR("TIEL_PREFILL_RESIDENT fallback_restore_failed=1\n");
+                return false;
+            }
+            phase_prefill_resident = false;
+        }
         phase_arena_enabled = false;
         phase_arena_decode = false;
         sched_need_reserve = true;
