@@ -52,6 +52,12 @@ This is persistent residency across ubatches, not the paper's transfer/computati
 
 `common/chat.h` identifies optional TOOL boundaries alongside USER boundaries. `tools/server/server-context.cpp` uses them in the existing checkpoint selection policy when LLAMA_SERVER_TOOL_CHECKPOINTS=1. It retains the existing state serialization/reuse machinery and checkpoint limits rather than implementing a second state cache. When a tool result changes, an earlier valid checkpoint can spare recomputation of the unchanged prefix. This improves incremental wall time, not the kernel's PP rate. Existing MTP, quantized KV and checkpoint infrastructure remain upstream mechanisms.
 
+### Pi reasoning profile: bounded thinking
+
+Reasoning-loop control is a client request policy, not part of the immutable runtime checkpoint. The server supports both `thinking_budget_tokens` and `reasoning_budget_tokens`; Pi is configured to send `thinking_budget_tokens` dynamically from its selected thinking level. The Tiel project profile uses 2,048 reasoning tokens for `low` and 4,096 for `high`, while retaining `temperature=0.6`, `top_p=0.95`, `top_k=20`, `reasoning_format=deepseek`, and the forced transition message `Wrap up and give the final answer.`
+
+The per-level values live in the project-local `.pi/settings.json` under `thinkingBudgets`. The two Tiel provider definitions in the user's `~/.pi/agent/models.json` set `compat.thinkingTokenBudgetField` to `thinking_budget_tokens`; their `samplingParams` contain the sampling values, reasoning format and transition message, but deliberately no fixed budget. This lets Pi choose 2,048 or 4,096 per request. It does not change model weights, FreeToken behavior, checkpoint hashes or server startup arguments. Existing Pi sessions must reload/restart before relying on changed settings.
+
 ## Articles, adaptation and deliberate omissions
 
 Primary references, checked against the papers rather than Reddit commentary:
